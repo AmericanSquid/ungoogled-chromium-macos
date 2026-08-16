@@ -1,0 +1,107 @@
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -219,6 +219,7 @@ source_set("browser") {
+     "//content/common:buildflags",
+     "//content/common:mojo_bindings",
+     "//content/common/memory_coordinator/mojom",
++    "//content/distributed:distributed_utility_proxy",
+     "//content/public/browser:proto",
+     "//content/public/common:buildflags",
+     "//content/public/common:common_sources",
+--- a/content/browser/DEPS
++++ b/content/browser/DEPS
+@@ -53,6 +53,7 @@ include_rules = [
+   # content-owners@chromium.org first.
+   # ****************************************************************************
+ 
++  "+content/distributed",
+   "+content/public/app",
+   "+content/public/browser",
+   "+device/base/synchronization",
+--- a/content/browser/service_host/utility_process_host.cc
++++ b/content/browser/service_host/utility_process_host.cc
+@@ -30,6 +30,7 @@
+ #include "content/browser/service_host/utility_sandbox_delegate.h"
+ #include "content/common/features.h"
+ #include "content/common/in_process_child_thread_params.h"
++#include "content/distributed/distributed_utility_proxy.h"
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/content_browser_client.h"
+@@ -321,6 +322,10 @@ void UtilityProcessHost::MaybeBindMojoInterfaces() {
+ }
+ 
+ bool UtilityProcessHost::StartProcess() {
++  if (distributed::IsRemoteEligibleUtilityService(options_.metrics_name_)) {
++    distributed::LogRemoteEligibleUtilityService(options_.metrics_name_);
++  }
++
+   process_->SetName(options_.name_);
+   process_->SetMetricsName(options_.metrics_name_);
+ 
+--- /dev/null
++++ b/content/distributed/BUILD.gn
+@@ -0,0 +1,12 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++source_set("distributed_utility_proxy") {
++  sources = [
++    "distributed_utility_proxy.cc",
++    "distributed_utility_proxy.h",
++  ]
++
++  deps = [ "//base" ]
++}
+--- /dev/null
++++ b/content/distributed/distributed_utility_proxy.cc
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/distributed/distributed_utility_proxy.h"
++
++#include "base/logging.h"
++
++namespace content::distributed {
++
++namespace {
++
++constexpr char kDataDecoderServiceName[] =
++    "data_decoder.mojom.DataDecoderService";
++
++}  // namespace
++
++bool IsRemoteEligibleUtilityService(const std::string& service_name) {
++  return service_name == kDataDecoderServiceName;
++}
++
++void LogRemoteEligibleUtilityService(const std::string& service_name) {
++  LOG(INFO) << "DISTRIBUTED: utility service eligible for remote execution: "
++            << service_name;
++}
++
++}  // namespace content::distributed
+--- /dev/null
++++ b/content/distributed/distributed_utility_proxy.h
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_PROXY_H_
++#define CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_PROXY_H_
++
++#include <string>
++
++namespace content::distributed {
++
++bool IsRemoteEligibleUtilityService(const std::string& service_name);
++
++void LogRemoteEligibleUtilityService(const std::string& service_name);
++
++}  // namespace content::distributed
++
++#endif  // CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_PROXY_H_
