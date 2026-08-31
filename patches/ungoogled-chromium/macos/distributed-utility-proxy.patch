@@ -58,7 +58,7 @@
  
 --- /dev/null
 +++ b/content/distributed/BUILD.gn
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,23 @@
 +# Copyright 2026 The Chromium Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -67,9 +67,20 @@
 +  sources = [
 +    "distributed_utility_proxy.cc",
 +    "distributed_utility_proxy.h",
++    "remote_gzipper_protocol.cc",
++    "remote_gzipper_protocol.h",
 +  ]
 +
 +  deps = [ "//base" ]
++}
++
++source_set("distributed_utility_proxy_tests") {
++  testonly = true
++  sources = [ "remote_gzipper_protocol_unittest.cc" ]
++  deps = [
++    ":distributed_utility_proxy",
++    "//testing/gtest",
++  ]
 +}
 --- /dev/null
 +++ b/content/distributed/distributed_utility_proxy.cc
@@ -162,6 +173,230 @@
 +}  // namespace content::distributed
 +
 +#endif  // CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_PROXY_H_
+--- /dev/null
++++ b/content/distributed/remote_gzipper_protocol.h
+@@ -0,0 +1,49 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_DISTRIBUTED_REMOTE_GZIPPER_PROTOCOL_H_
++#define CONTENT_DISTRIBUTED_REMOTE_GZIPPER_PROTOCOL_H_
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace content::distributed {
++
++constexpr uint64_t kRemoteGzipperMaxPayloadSize = 64u * 1024u * 1024u;
++
++enum class RemoteGzipperMessageType : uint8_t {
++  kRequest = 1,
++  kSuccess = 2,
++  kFailure = 3,
++};
++
++enum class RemoteGzipperOperation : uint8_t {
++  kDeflate = 1,
++  kInflate = 2,
++  kCompress = 3,
++  kUncompress = 4,
++};
++
++struct RemoteGzipperFrame {
++  RemoteGzipperMessageType message_type;
++  RemoteGzipperOperation operation;
++  uint64_t request_id;
++  std::string payload;
++};
++
++std::optional<std::string> SerializeRemoteGzipperFrame(
++    const RemoteGzipperFrame& frame);
++
++std::optional<RemoteGzipperFrame> ParseRemoteGzipperFrame(
++    std::string_view serialized_frame);
++
++std::optional<std::string> MakeRemoteGzipperInflatePayload(
++    uint64_t max_uncompressed_size,
++    std::string_view compressed_data);
++
++}  // namespace content::distributed
++
++#endif  // CONTENT_DISTRIBUTED_REMOTE_GZIPPER_PROTOCOL_H_
+--- /dev/null
++++ b/content/distributed/remote_gzipper_protocol.cc
+@@ -0,0 +1,115 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/distributed/remote_gzipper_protocol.h"
++
++namespace content::distributed {
++
++namespace {
++
++constexpr char kMagic[] = "UCD1";
++constexpr uint16_t kProtocolVersion = 1;
++constexpr size_t kHeaderSize = 24;
++
++void AppendUint16(uint16_t value, std::string* output) {
++  output->push_back(static_cast<char>((value >> 8) & 0xff));
++  output->push_back(static_cast<char>(value & 0xff));
++}
++
++void AppendUint64(uint64_t value, std::string* output) {
++  for (int shift = 56; shift >= 0; shift -= 8) {
++    output->push_back(static_cast<char>((value >> shift) & 0xff));
++  }
++}
++
++uint16_t ReadUint16(std::string_view input, size_t offset) {
++  return (static_cast<uint16_t>(static_cast<unsigned char>(input[offset])) << 8) |
++         static_cast<unsigned char>(input[offset + 1]);
++}
++
++uint64_t ReadUint64(std::string_view input, size_t offset) {
++  uint64_t value = 0;
++  for (size_t index = 0; index < sizeof(value); ++index) {
++    value = (value << 8) |
++            static_cast<unsigned char>(input[offset + index]);
++  }
++  return value;
++}
++
++bool IsValidMessageType(RemoteGzipperMessageType message_type) {
++  return message_type == RemoteGzipperMessageType::kRequest ||
++         message_type == RemoteGzipperMessageType::kSuccess ||
++         message_type == RemoteGzipperMessageType::kFailure;
++}
++
++bool IsValidOperation(RemoteGzipperOperation operation) {
++  return operation == RemoteGzipperOperation::kDeflate ||
++         operation == RemoteGzipperOperation::kInflate ||
++         operation == RemoteGzipperOperation::kCompress ||
++         operation == RemoteGzipperOperation::kUncompress;
++}
++
++}  // namespace
++
++std::optional<std::string> SerializeRemoteGzipperFrame(
++    const RemoteGzipperFrame& frame) {
++  if (!IsValidMessageType(frame.message_type) || !IsValidOperation(frame.operation) ||
++      frame.request_id == 0 ||
++      frame.payload.size() > kRemoteGzipperMaxPayloadSize) {
++    return std::nullopt;
++  }
++
++  std::string output;
++  output.reserve(kHeaderSize + frame.payload.size());
++  output.append(kMagic, sizeof(kMagic) - 1);
++  AppendUint16(kProtocolVersion, &output);
++  output.push_back(static_cast<char>(frame.message_type));
++  output.push_back(static_cast<char>(frame.operation));
++  AppendUint64(frame.request_id, &output);
++  AppendUint64(frame.payload.size(), &output);
++  output.append(frame.payload);
++  return output;
++}
++
++std::optional<RemoteGzipperFrame> ParseRemoteGzipperFrame(
++    std::string_view serialized_frame) {
++  if (serialized_frame.size() < kHeaderSize ||
++      serialized_frame.substr(0, 4) != std::string_view(kMagic, 4) ||
++      ReadUint16(serialized_frame, 4) != kProtocolVersion) {
++    return std::nullopt;
++  }
++
++  const auto message_type = static_cast<RemoteGzipperMessageType>(
++      static_cast<unsigned char>(serialized_frame[6]));
++  const auto operation = static_cast<RemoteGzipperOperation>(
++      static_cast<unsigned char>(serialized_frame[7]));
++  const uint64_t request_id = ReadUint64(serialized_frame, 8);
++  const uint64_t payload_size = ReadUint64(serialized_frame, 16);
++  if (!IsValidMessageType(message_type) || !IsValidOperation(operation) ||
++      request_id == 0 || payload_size > kRemoteGzipperMaxPayloadSize ||
++      payload_size != serialized_frame.size() - kHeaderSize) {
++    return std::nullopt;
++  }
++
++  return RemoteGzipperFrame{message_type, operation, request_id,
++                            std::string(serialized_frame.substr(kHeaderSize))};
++}
++
++std::optional<std::string> MakeRemoteGzipperInflatePayload(
++    uint64_t max_uncompressed_size,
++    std::string_view compressed_data) {
++  if (max_uncompressed_size > kRemoteGzipperMaxPayloadSize ||
++      compressed_data.size() >
++          kRemoteGzipperMaxPayloadSize - sizeof(max_uncompressed_size)) {
++    return std::nullopt;
++  }
++
++  std::string output;
++  output.reserve(sizeof(max_uncompressed_size) + compressed_data.size());
++  AppendUint64(max_uncompressed_size, &output);
++  output.append(compressed_data);
++  return output;
++}
++
++}  // namespace content::distributed
+--- /dev/null
++++ b/content/distributed/remote_gzipper_protocol_unittest.cc
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/distributed/remote_gzipper_protocol.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace content::distributed {
++namespace {
++
++TEST(RemoteGzipperProtocolTest, RoundTripsRequestFrame) {
++  RemoteGzipperFrame frame{RemoteGzipperMessageType::kRequest,
++                           RemoteGzipperOperation::kDeflate, 42, "payload"};
++  const auto serialized = SerializeRemoteGzipperFrame(frame);
++  ASSERT_TRUE(serialized);
++
++  const auto parsed = ParseRemoteGzipperFrame(*serialized);
++  ASSERT_TRUE(parsed);
++  EXPECT_EQ(RemoteGzipperMessageType::kRequest, parsed->message_type);
++  EXPECT_EQ(RemoteGzipperOperation::kDeflate, parsed->operation);
++  EXPECT_EQ(42u, parsed->request_id);
++  EXPECT_EQ("payload", parsed->payload);
++}
++
++TEST(RemoteGzipperProtocolTest, RejectsTrailingBytes) {
++  RemoteGzipperFrame frame{RemoteGzipperMessageType::kSuccess,
++                           RemoteGzipperOperation::kCompress, 7, "result"};
++  auto serialized = SerializeRemoteGzipperFrame(frame);
++  ASSERT_TRUE(serialized);
++  serialized->push_back('x');
++  EXPECT_FALSE(ParseRemoteGzipperFrame(*serialized));
++}
++
++TEST(RemoteGzipperProtocolTest, RejectsZeroRequestId) {
++  RemoteGzipperFrame frame{RemoteGzipperMessageType::kRequest,
++                           RemoteGzipperOperation::kUncompress, 0, "input"};
++  EXPECT_FALSE(SerializeRemoteGzipperFrame(frame));
++}
++
++TEST(RemoteGzipperProtocolTest, InflatePayloadPrefixesOutputLimit) {
++  const auto payload = MakeRemoteGzipperInflatePayload(513, "compressed");
++  ASSERT_TRUE(payload);
++  ASSERT_EQ(8u + std::string_view("compressed").size(), payload->size());
++  EXPECT_EQ(0, static_cast<unsigned char>((*payload)[6]));
++  EXPECT_EQ(2, static_cast<unsigned char>((*payload)[7]));
++  EXPECT_EQ("compressed", payload->substr(8));
++}
++
++}  // namespace
++}  // namespace content::distributed
 --- /dev/null
 +++ b/content/distributed/REMOTE_GZIPPER_PROTOCOL.md
 @@ -0,0 +1,74 @@
