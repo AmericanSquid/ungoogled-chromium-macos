@@ -23,7 +23,10 @@ ERROR_LIMIT = 1024
 
 
 class ProtocolError(Exception):
-    pass
+    def __init__(self, message, request_id=0, operation=0):
+        super().__init__(message)
+        self.request_id = request_id
+        self.operation = operation
 
 
 def read_exact(connection, size):
@@ -41,17 +44,17 @@ def read_frame(connection):
         HEADER.unpack(read_exact(connection, HEADER.size))
     )
     if magic != MAGIC:
-        raise ProtocolError("invalid magic")
+        raise ProtocolError("invalid magic", request_id, operation)
     if version != VERSION:
-        raise ProtocolError("unsupported protocol version")
+        raise ProtocolError("unsupported protocol version", request_id, operation)
     if message_type != REQUEST:
-        raise ProtocolError("expected a request frame")
+        raise ProtocolError("expected a request frame", request_id, operation)
     if operation not in (DEFLATE, INFLATE, COMPRESS, UNCOMPRESS):
-        raise ProtocolError("unsupported operation")
+        raise ProtocolError("unsupported operation", request_id, operation)
     if request_id == 0:
-        raise ProtocolError("request ID must be nonzero")
+        raise ProtocolError("request ID must be nonzero", request_id, operation)
     if payload_size > MAX_PAYLOAD:
-        raise ProtocolError("payload exceeds 64 MiB limit")
+        raise ProtocolError("payload exceeds 64 MiB limit", request_id, operation)
     return operation, request_id, read_exact(connection, payload_size)
 
 
@@ -117,6 +120,8 @@ def handle(connection, peer):
         write_frame(connection, SUCCESS, operation, request_id, output)
     except (OSError, ProtocolError, zlib.error) as error:
         logging.warning("request from %s failed: %s", peer, error)
+        request_id = request_id or getattr(error, "request_id", 0)
+        operation = operation or getattr(error, "operation", 0)
         if request_id:
             message = str(error).encode("utf-8")[:ERROR_LIMIT]
             try:

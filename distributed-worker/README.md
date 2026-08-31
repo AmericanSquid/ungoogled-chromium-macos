@@ -27,3 +27,11 @@ When the Chromium proxy is implemented, start Chromium with:
 This service is intentionally single-request and synchronous for the first
 experiment. It supports raw-DEFLATE operations separately from gzip operations,
 applies the protocol's 64 MiB cap, and closes every connection after responding.
+
+## Test it
+
+Run the worker's socket-level tests on Debian or macOS:
+
+```sh
+python3 -m unittest -v test_gzipper_worker.py
+```
