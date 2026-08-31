@@ -32,7 +32,7 @@ jobs:
       - name: Copy GitHub specific scripts to git-root folder
         run: cp -va ./.github/scripts/ ./
       - name: Disable Spotlight
-        run: sudo mdutil -a -i off
+        run: sudo mdutil -a -i off || true
       - name: Install coreutils
         run: brew install coreutils
       - name: Prepare release
