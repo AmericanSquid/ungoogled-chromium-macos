@@ -34,16 +34,23 @@ index e605be3d..299e1261 100644
  #include "content/public/browser/audio_service.h"
  #include "content/public/browser/background_tracing.h"
  #include "content/public/browser/browser_main_parts.h"
-@@ -402,6 +403,16 @@ class OopDataDecoder : public data_decoder::ServiceProvider {
+@@ -402,6 +403,23 @@ class OopDataDecoder : public data_decoder::ServiceProvider {
    void BindDataDecoderService(
        mojo::PendingReceiver<data_decoder::mojom::DataDecoderService> receiver)
        override {
 +    if (distributed::ShouldRouteDataDecoderRemotely()) {
 +      const auto token = distributed::GetDistributedUtilityToken();
 +      if (token) {
++        mojo::Remote<data_decoder::mojom::DataDecoderService> local_service;
++        ServiceProcessHost::Launch(
++            local_service.BindNewPipeAndPassReceiver(),
++            ServiceProcessHost::Options()
++                .WithDisplayName("Data Decoder Service (local fallback)")
++                .Pass());
 +        distributed::BindRemoteDataDecoderService(
 +            std::move(receiver),
-+            distributed::GetDistributedUtilityWorkerEndpoint(), *token);
++            distributed::GetDistributedUtilityWorkerEndpoint(), *token,
++            local_service.Unbind());
 +        return;
 +      }
 +    }
@@ -79,7 +86,7 @@ new file mode 100644
 index 00000000..2b37f3d0
 --- /dev/null
 +++ b/content/distributed/BUILD.gn
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,91 @@
 +# Copyright 2026 The Chromium Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -97,7 +104,6 @@ index 00000000..2b37f3d0
 +  deps = [
 +    ":remote_gzipper_protocol",
 +    "//base",
-+    "//content/public/browser",
 +    "//mojo/public/cpp/bindings",
 +    "//net",
 +    "//services/data_decoder/public/mojom",
@@ -374,7 +380,7 @@ new file mode 100644
 index 00000000..489cd688
 --- /dev/null
 +++ b/content/distributed/distributed_utility_proxy.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,48 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -385,6 +391,7 @@ index 00000000..489cd688
 +#include <optional>
 +#include <string>
 +
++#include "mojo/public/cpp/bindings/pending_remote.h"
 +#include "services/data_decoder/public/mojom/data_decoder_service.mojom.h"
 +
 +namespace content::distributed {
@@ -414,7 +421,9 @@ index 00000000..489cd688
 +void BindRemoteDataDecoderService(
 +    mojo::PendingReceiver<data_decoder::mojom::DataDecoderService> receiver,
 +    std::string worker_endpoint,
-+    std::string authentication_data);
++    std::string authentication_data,
++    mojo::PendingRemote<data_decoder::mojom::DataDecoderService>
++        local_service);
 +
 +void LogRemoteEligibleUtilityService(const std::string& service_name);
 +
@@ -426,7 +435,7 @@ new file mode 100644
 index 00000000..aa0897a5
 --- /dev/null
 +++ b/content/distributed/remote_data_decoder_service.cc
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,219 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -440,9 +449,9 @@ index 00000000..aa0897a5
 +#include <string>
 +#include <utility>
 +
++#include "base/check.h"
 +#include "base/functional/bind.h"
 +#include "base/memory/weak_ptr.h"
-+#include "content/public/browser/service_process_host.h"
 +#include "mojo/public/cpp/bindings/remote.h"
 +#include "mojo/public/cpp/bindings/self_owned_receiver.h"
 +
@@ -535,15 +544,8 @@ index 00000000..aa0897a5
 +                    mojo::PendingRemote<DataDecoder> local_service)
 +      : endpoint_(std::move(endpoint)),
 +        authentication_data_(std::move(authentication_data)) {
-+    if (local_service.is_valid()) {
-+      local_service_.Bind(std::move(local_service));
-+    } else {
-+      ServiceProcessHost::Launch(
-+          local_service_.BindNewPipeAndPassReceiver(),
-+          ServiceProcessHost::Options()
-+              .WithDisplayName("Data Decoder Service (local fallback)")
-+              .Pass());
-+    }
++    CHECK(local_service.is_valid());
++    local_service_.Bind(std::move(local_service));
 +  }
 +
 +  RemoteDataDecoder(const RemoteDataDecoder&) = delete;
@@ -633,10 +635,13 @@ index 00000000..aa0897a5
 +void BindRemoteDataDecoderService(
 +    mojo::PendingReceiver<data_decoder::mojom::DataDecoderService> receiver,
 +    std::string worker_endpoint,
-+    std::string authentication_data) {
++    std::string authentication_data,
++    mojo::PendingRemote<data_decoder::mojom::DataDecoderService>
++        local_service) {
 +  BindRemoteDataDecoderServiceImpl(std::move(receiver),
 +                                   std::move(worker_endpoint),
-+                                   std::move(authentication_data), {});
++                                   std::move(authentication_data),
++                                   std::move(local_service));
 +}
 +
 +void BindRemoteDataDecoderServiceForTesting(
@@ -3330,10 +3335,11 @@ diff --git a/services/data_decoder/BUILD.gn b/services/data_decoder/BUILD.gn
 index 545a1c59..bb567346 100644
 --- a/services/data_decoder/BUILD.gn
 +++ b/services/data_decoder/BUILD.gn
-@@ -13,4 +13,6 @@ source_set("lib") {
+@@ -13,4 +13,7 @@ source_set("lib") {
      ":*",
      "public/cpp:*",
      "//chrome/utility",
 +    "//content/distributed:distributed_utility_worker_lib",
 +    "//content/distributed:distributed_utility_proxy_tests",
++    "//content/distributed:distributed_utility_worker_tests",
      "//content/utility",
