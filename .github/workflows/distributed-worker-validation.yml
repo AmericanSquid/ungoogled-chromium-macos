@@ -1,0 +1,29 @@
+name: Validate Python development harness
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - distributed-utility-proxy-ci
+    paths:
+      - distributed-worker/**
+      - .github/workflows/distributed-worker-validation.yml
+
+permissions:
+  contents: read
+
+jobs:
+  python-harness-tests-debian-x86_64:
+    name: Non-production harness tests on Debian x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = x86_64
+      - name: Run worker tests in Debian Bookworm
+        run: >-
+          docker run --rm
+          --mount type=bind,source="$GITHUB_WORKSPACE",target=/src,readonly
+          --workdir /src/distributed-worker
+          debian:bookworm-slim
+          bash -ec 'apt-get update && apt-get install --yes --no-install-recommends python3 && python3 -m unittest -v test_gzipper_worker.py'

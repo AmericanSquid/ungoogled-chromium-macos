@@ -29,4 +29,22 @@ mkdir -p "$_src_dir/third_party/rust-toolchain/bin"
 
 "$_root_dir/retrieve_and_unpack_resource.sh" -p "$_target_cpu"
 
+# Restore the DevTools esbuild CIPD dependency.
+_esbuild_platform="mac-amd64"
+if [[ $(uname -m) == "arm64" ]]; then
+  _esbuild_platform="mac-arm64"
+fi
+
+printf 'infra/3pp/tools/esbuild/%s version:3@0.25.1.chromium.2\n'   "$_esbuild_platform" |
+  "$_src_dir/third_party/depot_tools/cipd" ensure     -root "$_src_dir/third_party/devtools-frontend/src/third_party/esbuild"     -ensure-file -
+
+# Restore Dawn's pinned Go toolchain for source generation.
+_dawn_go_platform="mac-amd64"
+if [[ $(uname -m) == "arm64" ]]; then
+  _dawn_go_platform="mac-arm64"
+fi
+
+printf 'infra/3pp/tools/go/%s version:3@1.25.0\n'   "$_dawn_go_platform" |
+  "$_src_dir/third_party/depot_tools/cipd" ensure     -cache-dir "$_download_cache/cipd"     -root "$_src_dir/third_party/dawn/tools/golang/$_dawn_go_platform"     -ensure-file -
+
 rm -rvf "$_download_cache"
