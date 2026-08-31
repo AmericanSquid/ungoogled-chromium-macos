@@ -23,13 +23,14 @@
 @@ -4,1 +4,2 @@
  #include "content/browser/browser_main_loop.h"
 +#include "content/distributed/distributed_utility_proxy.h"
-@@ -892,6 +893,12 @@ class OopDataDecoder : public data_decoder::ServiceProvider {
+@@ -892,6 +893,13 @@ class OopDataDecoder : public data_decoder::ServiceProvider {
    void BindDataDecoderService(
        mojo::PendingReceiver<data_decoder::mojom::DataDecoderService> receiver)
        override {
 +    if (distributed::ShouldRouteDataDecoderRemotely()) {
 +      distributed::BindRemoteDataDecoderService(
-+          std::move(receiver), distributed::GetDistributedWorkerEndpoint());
++          std::move(receiver),
++          distributed::GetDistributedUtilityWorkerEndpoint());
 +      return;
 +    }
 +
@@ -93,7 +94,7 @@
 +}
 --- /dev/null
 +++ b/content/distributed/distributed_utility_proxy.cc
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,79 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -101,7 +102,10 @@
 +#include "content/distributed/distributed_utility_proxy.h"
 +
 +#include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
 +#include "base/logging.h"
++#include "base/strings/string_util.h"
 +
 +namespace content::distributed {
 +
@@ -109,9 +113,11 @@
 +
 +constexpr char kDataDecoderServiceName[] =
 +    "data_decoder.mojom.DataDecoderService";
-+constexpr char kEnableDistributedDataDecoder[] =
-+    "distributed-data-decoder";
-+constexpr char kDistributedWorker[] = "distributed-worker";
++constexpr char kEnableDistributedUtilityProxy[] =
++    "enable-distributed-utility-proxy";
++constexpr char kDistributedUtilityWorker[] = "distributed-utility-worker";
++constexpr char kDistributedUtilityTokenFile[] =
++    "distributed-utility-token-file";
 +
 +}  // namespace
 +
@@ -119,19 +125,40 @@
 +  return service_name == kDataDecoderServiceName;
 +}
 +
-+bool IsDistributedDataDecoderEnabled() {
++bool IsDistributedUtilityProxyEnabled() {
 +  return base::CommandLine::ForCurrentProcess()->HasSwitch(
-+      kEnableDistributedDataDecoder);
++      kEnableDistributedUtilityProxy);
 +}
 +
-+std::string GetDistributedWorkerEndpoint() {
++std::string GetDistributedUtilityWorkerEndpoint() {
 +  return base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
-+      kDistributedWorker);
++      kDistributedUtilityWorker);
++}
++
++std::string GetDistributedUtilityTokenFile() {
++  return base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++      kDistributedUtilityTokenFile);
++}
++
++std::optional<std::string> GetDistributedUtilityToken() {
++  const std::string token_file = GetDistributedUtilityTokenFile();
++  if (token_file.empty()) {
++    return std::nullopt;
++  }
++  std::string token;
++  if (!base::ReadFileToString(base::FilePath::FromUTF8Unsafe(token_file),
++                              &token)) {
++    return std::nullopt;
++  }
++  base::TrimWhitespaceASCII(token, base::TRIM_ALL, &token);
++  return token.empty() ? std::nullopt
++                       : std::make_optional(std::move(token));
 +}
 +
 +bool ShouldRouteDataDecoderRemotely() {
-+  return IsDistributedDataDecoderEnabled() &&
-+         !GetDistributedWorkerEndpoint().empty();
++  return IsDistributedUtilityProxyEnabled() &&
++         !GetDistributedUtilityWorkerEndpoint().empty() &&
++         GetDistributedUtilityToken().has_value();
 +}
 +
 +void LogRemoteDataDecoderFallback(const std::string& worker_endpoint) {
@@ -149,7 +176,7 @@
 +}  // namespace content::distributed
 --- /dev/null
 +++ b/content/distributed/distributed_utility_proxy.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,45 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -157,6 +184,7 @@
 +#ifndef CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_PROXY_H_
 +#define CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_PROXY_H_
 +
++#include <optional>
 +#include <string>
 +
 +#include "services/data_decoder/public/mojom/data_decoder_service.mojom.h"
@@ -165,14 +193,20 @@
 +
 +bool IsRemoteEligibleUtilityService(const std::string& service_name);
 +
-+// Returns true when the distributed Data Decoder path was explicitly enabled.
-+bool IsDistributedDataDecoderEnabled();
++// Returns true only when the distributed utility proxy was explicitly enabled.
++bool IsDistributedUtilityProxyEnabled();
 +
 +// Returns the configured worker endpoint, for example "100.64.0.2:8765".
 +// An empty result means no worker endpoint was configured.
-+std::string GetDistributedWorkerEndpoint();
++std::string GetDistributedUtilityWorkerEndpoint();
 +
-+// Returns true only when remote routing is enabled and an endpoint is set.
++// Returns the configured token-file path, or an empty string if it is absent.
++std::string GetDistributedUtilityTokenFile();
++
++// Reads and trims the required authentication token. It never logs the token.
++std::optional<std::string> GetDistributedUtilityToken();
++
++// Returns true only when remote routing has its required configuration.
 +bool ShouldRouteDataDecoderRemotely();
 +
 +// Records that the configured remote route has fallen back to the local
