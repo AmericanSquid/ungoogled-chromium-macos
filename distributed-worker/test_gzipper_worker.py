@@ -100,6 +100,13 @@ class GzipperWorkerTest(unittest.TestCase):
         self.assertEqual(worker.FAILURE, header[2])
         self.assertEqual(10, header[4])
 
+    def test_failure_logs_exclude_payload_data(self):
+        payload_marker = b"telehealth-payload-must-not-appear-in-logs"
+        with self.assertLogs(level="WARNING") as captured:
+            header, _ = self.exchange(worker.UNCOMPRESS, payload_marker)
+        self.assertEqual(worker.FAILURE, header[2])
+        self.assertNotIn(payload_marker.decode(), "\n".join(captured.output))
+
 
 if __name__ == "__main__":
     unittest.main()
