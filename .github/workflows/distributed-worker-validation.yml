@@ -1,4 +1,4 @@
-name: Validate distributed worker
+name: Validate Python development harness
 
 on:
   workflow_dispatch:
@@ -13,8 +13,8 @@ permissions:
   contents: read
 
 jobs:
-  worker-tests-debian-x86_64:
-    name: Worker tests on Debian x86_64
+  python-harness-tests-debian-x86_64:
+    name: Non-production harness tests on Debian x86_64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

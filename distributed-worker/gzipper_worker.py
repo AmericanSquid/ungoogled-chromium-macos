@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Tailscale-bound worker for content/distributed/REMOTE_GZIPPER_PROTOCOL.md."""
+"""NON-PRODUCTION protocol-v1 development harness.
+
+The production worker is Chromium's Linux x86_64 GN target
+//content/distributed:distributed_utility_worker. This Python program exists
+only for local protocol development and must not be deployed.
+"""
 
 import argparse
+import hmac
 import logging
 import socket
 import struct
@@ -10,23 +16,27 @@ import zlib
 
 MAGIC = b"UCD1"
 VERSION = 1
-HEADER = struct.Struct("!4sHBBQQ")
-REQUEST = 1
-SUCCESS = 2
-FAILURE = 3
+REQUEST_HEADER = struct.Struct("!4sHBBQIQ")
+RESPONSE_HEADER = struct.Struct("!4sHBBQIQ")
 DEFLATE = 1
-INFLATE = 2
-COMPRESS = 3
-UNCOMPRESS = 4
+SUCCESS = 1
+FAILURE = 2
+ERROR_NONE = 0
+ERROR_MISSING_AUTHENTICATION = 1
+ERROR_AUTHENTICATION_FAILED = 2
+ERROR_UNSUPPORTED_OPERATION = 3
+ERROR_MALFORMED_FRAME = 4
+ERROR_OVERSIZED_PAYLOAD = 5
+ERROR_INTERNAL = 6
+MAX_AUTHENTICATION = 4096
 MAX_PAYLOAD = 64 * 1024 * 1024
-ERROR_LIMIT = 1024
 
 
 class ProtocolError(Exception):
-    def __init__(self, message, request_id=0, operation=0):
-        super().__init__(message)
+    def __init__(self, error_code, request_id=0):
+        super().__init__(f"protocol error {error_code}")
+        self.error_code = error_code
         self.request_id = request_id
-        self.operation = operation
 
 
 def read_exact(connection, size):
@@ -34,35 +44,36 @@ def read_exact(connection, size):
     while len(chunks) < size:
         chunk = connection.recv(size - len(chunks))
         if not chunk:
-            raise ProtocolError("unexpected end of connection")
+            raise ProtocolError(ERROR_MALFORMED_FRAME)
         chunks.extend(chunk)
     return bytes(chunks)
 
 
-def read_frame(connection):
-    magic, version, message_type, operation, request_id, payload_size = (
-        HEADER.unpack(read_exact(connection, HEADER.size))
+def read_request(connection):
+    header = read_exact(connection, REQUEST_HEADER.size)
+    magic, version, operation, reserved, request_id, auth_size, payload_size = (
+        REQUEST_HEADER.unpack(header)
     )
-    if magic != MAGIC:
-        raise ProtocolError("invalid magic", request_id, operation)
-    if version != VERSION:
-        raise ProtocolError("unsupported protocol version", request_id, operation)
-    if message_type != REQUEST:
-        raise ProtocolError("expected a request frame", request_id, operation)
-    if operation not in (DEFLATE, INFLATE, COMPRESS, UNCOMPRESS):
-        raise ProtocolError("unsupported operation", request_id, operation)
     if request_id == 0:
-        raise ProtocolError("request ID must be nonzero", request_id, operation)
+        raise ProtocolError(ERROR_MALFORMED_FRAME)
+    if magic != MAGIC or version != VERSION or reserved != 0:
+        raise ProtocolError(ERROR_MALFORMED_FRAME, request_id)
     if payload_size > MAX_PAYLOAD:
-        raise ProtocolError("payload exceeds 64 MiB limit", request_id, operation)
-    return operation, request_id, read_exact(connection, payload_size)
+        raise ProtocolError(ERROR_OVERSIZED_PAYLOAD, request_id)
+    if auth_size > MAX_AUTHENTICATION:
+        raise ProtocolError(ERROR_MALFORMED_FRAME, request_id)
+    authentication = read_exact(connection, auth_size)
+    payload = read_exact(connection, payload_size)
+    return request_id, operation, authentication, payload
 
 
-def write_frame(connection, message_type, operation, request_id, payload):
-    if len(payload) > MAX_PAYLOAD:
-        raise ProtocolError("response exceeds 64 MiB limit")
+def write_response(connection, request_id, status, error, payload=b""):
+    if request_id == 0 or len(payload) > MAX_PAYLOAD:
+        raise ProtocolError(ERROR_INTERNAL, request_id)
     connection.sendall(
-        HEADER.pack(MAGIC, VERSION, message_type, operation, request_id, len(payload))
+        RESPONSE_HEADER.pack(
+            MAGIC, VERSION, status, 0, request_id, error, len(payload)
+        )
         + payload
     )
 
@@ -72,60 +83,32 @@ def raw_deflate(data):
     return compressor.compress(data) + compressor.flush()
 
 
-def raw_inflate(data, max_size):
-    if max_size > MAX_PAYLOAD:
-        raise ProtocolError("requested output limit exceeds 64 MiB")
-    decompressor = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
-    result = decompressor.decompress(data, max_size + 1)
-    if len(result) > max_size or decompressor.unconsumed_tail:
-        raise ProtocolError("inflated data exceeds requested output limit")
-    result += decompressor.flush(max_size + 1 - len(result))
-    if len(result) > max_size or not decompressor.eof:
-        raise ProtocolError("invalid or incomplete raw DEFLATE payload")
-    return result
-
-
-def gzip_uncompress(data):
-    decompressor = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
-    result = decompressor.decompress(data, MAX_PAYLOAD + 1)
-    if len(result) > MAX_PAYLOAD or decompressor.unconsumed_tail:
-        raise ProtocolError("gzip output exceeds 64 MiB limit")
-    result += decompressor.flush(MAX_PAYLOAD + 1 - len(result))
-    if len(result) > MAX_PAYLOAD or not decompressor.eof:
-        raise ProtocolError("invalid or incomplete gzip payload")
-    return result
-
-
-def process(operation, payload):
-    if operation == DEFLATE:
-        return raw_deflate(payload)
-    if operation == INFLATE:
-        if len(payload) < 8:
-            raise ProtocolError("inflate payload is missing its output limit")
-        max_size = struct.unpack("!Q", payload[:8])[0]
-        return raw_inflate(payload[8:], max_size)
-    if operation == COMPRESS:
-        compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
-        return compressor.compress(payload) + compressor.flush()
-    return gzip_uncompress(payload)
-
-
-def handle(connection, peer):
+def handle(connection, expected_token):
     connection.settimeout(10)
     request_id = 0
-    operation = 0
     try:
-        operation, request_id, payload = read_frame(connection)
-        output = process(operation, payload)
-        write_frame(connection, SUCCESS, operation, request_id, output)
-    except (OSError, ProtocolError, zlib.error) as error:
-        logging.warning("request from %s failed: %s", peer, error)
-        request_id = request_id or getattr(error, "request_id", 0)
-        operation = operation or getattr(error, "operation", 0)
-        if request_id:
-            message = str(error).encode("utf-8")[:ERROR_LIMIT]
+        request_id, operation, authentication, payload = read_request(connection)
+        if not authentication:
+            raise ProtocolError(ERROR_MISSING_AUTHENTICATION, request_id)
+        if not hmac.compare_digest(authentication, expected_token):
+            raise ProtocolError(ERROR_AUTHENTICATION_FAILED, request_id)
+        if operation != DEFLATE:
+            raise ProtocolError(ERROR_UNSUPPORTED_OPERATION, request_id)
+        write_response(
+            connection, request_id, SUCCESS, ERROR_NONE, raw_deflate(payload)
+        )
+    except ProtocolError as error:
+        if error.request_id:
             try:
-                write_frame(connection, FAILURE, operation, request_id, message)
+                write_response(
+                    connection, error.request_id, FAILURE, error.error_code
+                )
+            except OSError:
+                pass
+    except (OSError, zlib.error):
+        if request_id:
+            try:
+                write_response(connection, request_id, FAILURE, ERROR_INTERNAL)
             except OSError:
                 pass
     finally:
@@ -133,31 +116,42 @@ def handle(connection, peer):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Remote Chromium Gzipper worker")
-    parser.add_argument(
-        "--host",
-        required=True,
-        help="Tailscale IP address to bind; do not use 0.0.0.0 or ::",
+    parser = argparse.ArgumentParser(
+        description="NON-PRODUCTION remote Gzipper protocol harness"
     )
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--port", required=True, type=int)
+    parser.add_argument("--token-file", required=True)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     if args.host in ("0.0.0.0", "::"):
-        raise SystemExit("refusing to bind a public/wildcard address")
+        raise SystemExit("refusing to bind a wildcard address")
+    with open(args.token_file, "rb") as token_stream:
+        expected_token = token_stream.read().strip()
+    if not expected_token:
+        raise SystemExit("token file is empty")
+
     family = socket.AF_INET6 if ":" in args.host else socket.AF_INET
     with socket.socket(family, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((args.host, args.port))
         listener.listen()
-        logging.info("listening on %s:%d", args.host, args.port)
-        while True:
-            connection, peer = listener.accept()
-            handle(connection, peer)
+        logging.warning(
+            "NON-PRODUCTION harness listening on %s:%d", args.host, args.port
+        )
+        try:
+            while True:
+                connection, _ = listener.accept()
+                handle(connection, expected_token)
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     main()

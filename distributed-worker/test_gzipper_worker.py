@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""End-to-end socket tests for gzipper_worker.py."""
+"""Socket tests for the NON-PRODUCTION Python protocol harness."""
 
 import importlib.util
 import pathlib
 import socket
-import struct
 import threading
 import unittest
+import zlib
 
 
 WORKER_PATH = pathlib.Path(__file__).with_name("gzipper_worker.py")
@@ -15,97 +15,71 @@ worker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(worker)
 
 
-class GzipperWorkerTest(unittest.TestCase):
-    def exchange(self, operation, payload, request_id=1):
-        server, client = socket.socketpair()
-        thread = threading.Thread(target=worker.handle, args=(server, "test"))
+class GzipperDevelopmentHarnessTest(unittest.TestCase):
+    def exchange(self, frame, token=b"test-token"):
+        client, server = socket.socketpair()
+        thread = threading.Thread(target=worker.handle, args=(server, token))
         thread.start()
-        client.sendall(
-            worker.HEADER.pack(
-                worker.MAGIC,
-                worker.VERSION,
-                worker.REQUEST,
-                operation,
-                request_id,
-                len(payload),
-            )
-            + payload
-        )
-        response = bytearray()
-        while True:
-            chunk = client.recv(65536)
-            if not chunk:
-                break
-            response.extend(chunk)
+        client.sendall(frame)
+        header = worker.read_exact(client, worker.RESPONSE_HEADER.size)
+        fields = worker.RESPONSE_HEADER.unpack(header)
+        payload = worker.read_exact(client, fields[-1])
         client.close()
-        thread.join(2)
+        thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
-        return worker.HEADER.unpack(response[: worker.HEADER.size]), bytes(
-            response[worker.HEADER.size :]
+        return fields, payload
+
+    def request(
+        self,
+        request_id=7,
+        operation=worker.DEFLATE,
+        authentication=b"test-token",
+        payload=b"payload",
+    ):
+        return worker.REQUEST_HEADER.pack(
+            worker.MAGIC,
+            worker.VERSION,
+            operation,
+            0,
+            request_id,
+            len(authentication),
+            len(payload),
+        ) + authentication + payload
+
+    def test_authenticated_deflate_preserves_request_id(self):
+        fields, compressed = self.exchange(self.request(request_id=101))
+        self.assertEqual(101, fields[4])
+        self.assertEqual(worker.SUCCESS, fields[2])
+        self.assertEqual(worker.ERROR_NONE, fields[5])
+        self.assertEqual(b"payload", zlib.decompress(compressed, wbits=-15))
+
+    def test_missing_token(self):
+        fields, payload = self.exchange(self.request(authentication=b""))
+        self.assertEqual(worker.FAILURE, fields[2])
+        self.assertEqual(worker.ERROR_MISSING_AUTHENTICATION, fields[5])
+        self.assertEqual(b"", payload)
+
+    def test_bad_token(self):
+        fields, _ = self.exchange(self.request(authentication=b"bad-token"))
+        self.assertEqual(worker.ERROR_AUTHENTICATION_FAILED, fields[5])
+
+    def test_unsupported_operation(self):
+        fields, _ = self.exchange(self.request(operation=99))
+        self.assertEqual(worker.ERROR_UNSUPPORTED_OPERATION, fields[5])
+
+    def test_oversized_payload_is_rejected_from_header(self):
+        frame = worker.REQUEST_HEADER.pack(
+            worker.MAGIC,
+            worker.VERSION,
+            worker.DEFLATE,
+            0,
+            202,
+            len(b"test-token"),
+            worker.MAX_PAYLOAD + 1,
         )
-
-    def test_raw_deflate_and_inflate(self):
-        source = b"raw-deflate-data" * 100
-        compressed = worker.process(worker.DEFLATE, source)
-        header, output = self.exchange(
-            worker.INFLATE, struct.pack("!Q", len(source)) + compressed
-        )
-        self.assertEqual(worker.SUCCESS, header[2])
-        self.assertEqual(source, output)
-
-    def test_gzip_compress_and_uncompress(self):
-        source = b"gzip-data" * 100
-        compressed = worker.process(worker.COMPRESS, source)
-        header, output = self.exchange(worker.UNCOMPRESS, compressed)
-        self.assertEqual(worker.SUCCESS, header[2])
-        self.assertEqual(source, output)
-
-    def test_inflate_limit_returns_failure(self):
-        source = b"too-large-for-limit"
-        compressed = worker.process(worker.DEFLATE, source)
-        header, _ = self.exchange(
-            worker.INFLATE, struct.pack("!Q", 1) + compressed
-        )
-        self.assertEqual(worker.FAILURE, header[2])
-
-    def test_bad_magic_returns_failure(self):
-        server, client = socket.socketpair()
-        thread = threading.Thread(target=worker.handle, args=(server, "test"))
-        thread.start()
-        client.sendall(
-            worker.HEADER.pack(b"BAD!", worker.VERSION, worker.REQUEST,
-                               worker.COMPRESS, 9, 0)
-        )
-        response = client.recv(65536)
-        client.close()
-        thread.join(2)
-        self.assertFalse(thread.is_alive())
-        header = worker.HEADER.unpack(response[: worker.HEADER.size])
-        self.assertEqual(worker.FAILURE, header[2])
-        self.assertEqual(9, header[4])
-
-    def test_oversized_payload_returns_failure(self):
-        server, client = socket.socketpair()
-        thread = threading.Thread(target=worker.handle, args=(server, "test"))
-        thread.start()
-        client.sendall(
-            worker.HEADER.pack(worker.MAGIC, worker.VERSION, worker.REQUEST,
-                               worker.COMPRESS, 10, worker.MAX_PAYLOAD + 1)
-        )
-        response = client.recv(65536)
-        client.close()
-        thread.join(2)
-        self.assertFalse(thread.is_alive())
-        header = worker.HEADER.unpack(response[: worker.HEADER.size])
-        self.assertEqual(worker.FAILURE, header[2])
-        self.assertEqual(10, header[4])
-
-    def test_failure_logs_exclude_payload_data(self):
-        payload_marker = b"telehealth-payload-must-not-appear-in-logs"
-        with self.assertLogs(level="WARNING") as captured:
-            header, _ = self.exchange(worker.UNCOMPRESS, payload_marker)
-        self.assertEqual(worker.FAILURE, header[2])
-        self.assertNotIn(payload_marker.decode(), "\n".join(captured.output))
+        fields, _ = self.exchange(frame)
+        self.assertEqual(202, fields[4])
+        self.assertEqual(worker.ERROR_OVERSIZED_PAYLOAD, fields[5])
 
 
 if __name__ == "__main__":

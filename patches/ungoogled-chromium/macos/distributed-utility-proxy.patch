@@ -1,3 +1,5 @@
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index 2c3a21e0..89ecff97 100644
 --- a/content/browser/BUILD.gn
 +++ b/content/browser/BUILD.gn
 @@ -219,6 +219,7 @@ source_set("browser") {
@@ -8,6 +10,8 @@
      "//content/public/browser:proto",
      "//content/public/common:buildflags",
      "//content/public/common:common_sources",
+diff --git a/content/browser/DEPS b/content/browser/DEPS
+index 6ddfcb4f..da64990e 100644
 --- a/content/browser/DEPS
 +++ b/content/browser/DEPS
 @@ -53,6 +53,7 @@ include_rules = [
@@ -18,9 +22,11 @@
    "+content/public/app",
    "+content/public/browser",
    "+device/base/synchronization",
+diff --git a/content/browser/browser_main_loop.cc b/content/browser/browser_main_loop.cc
+index e605be3d..299e1261 100644
 --- a/content/browser/browser_main_loop.cc
 +++ b/content/browser/browser_main_loop.cc
-@@ -105,6 +105,7 @@
+@@ -107,6 +107,7 @@
  #include "content/common/pseudonymization_salt.h"
  #include "content/common/skia_utils.h"
  #include "content/common/thread_pool_util.h"
@@ -28,7 +34,7 @@
  #include "content/public/browser/audio_service.h"
  #include "content/public/browser/background_tracing.h"
  #include "content/public/browser/browser_main_parts.h"
-@@ -402,9 +403,19 @@ class OopDataDecoder : public data_decoder::ServiceProvider {
+@@ -402,6 +403,16 @@ class OopDataDecoder : public data_decoder::ServiceProvider {
    void BindDataDecoderService(
        mojo::PendingReceiver<data_decoder::mojom::DataDecoderService> receiver)
        override {
@@ -45,19 +51,8 @@
      ServiceProcessHost::Launch(
          std::move(receiver),
          ServiceProcessHost::Options()
-             .WithDisplayName("Data Decoder Service")
-             .Pass());
-   }
---- a/content/test/BUILD.gn
-+++ b/content/test/BUILD.gn
-@@ -3405,6 +3405,7 @@ test("content_unittests") {
-     "//content/child:for_content_tests",
-     "//content/common:for_content_tests",
-     "//content/common/memory_coordinator/mojom",
-     "//content/common/memory_coordinator/mojom:test_interfaces",
-+    "//content/distributed:distributed_utility_proxy_tests",
-     "//content/gpu",
-     "//content/public/browser",
+diff --git a/content/browser/service_host/utility_process_host.cc b/content/browser/service_host/utility_process_host.cc
+index 4d1115c7..2b5326a9 100644
 --- a/content/browser/service_host/utility_process_host.cc
 +++ b/content/browser/service_host/utility_process_host.cc
 @@ -30,6 +30,7 @@
@@ -79,9 +74,12 @@
    process_->SetName(options_.name_);
    process_->SetMetricsName(options_.metrics_name_);
  
+diff --git a/content/distributed/BUILD.gn b/content/distributed/BUILD.gn
+new file mode 100644
+index 00000000..a4e5cb8f
 --- /dev/null
 +++ b/content/distributed/BUILD.gn
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,85 @@
 +# Copyright 2026 The Chromium Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -93,16 +91,22 @@
 +    "remote_data_decoder_service.cc",
 +    "remote_gzipper_client.cc",
 +    "remote_gzipper_client.h",
-+    "remote_gzipper_protocol.cc",
-+    "remote_gzipper_protocol.h",
 +  ]
 +
 +  deps = [
++    ":remote_gzipper_protocol",
 +    "//base",
 +    "//content/public/browser",
 +    "//mojo/public/cpp/bindings",
 +    "//net",
 +    "//services/data_decoder/public/mojom",
++  ]
++}
++
++source_set("remote_gzipper_protocol") {
++  sources = [
++    "remote_gzipper_protocol.cc",
++    "remote_gzipper_protocol.h",
 +  ]
 +}
 +
@@ -121,6 +125,162 @@
 +    "//testing/gtest",
 +  ]
 +}
++
++if (is_linux && current_cpu == "x64") {
++  source_set("distributed_utility_worker_lib") {
++    sources = [
++      "remote_gzipper_worker.cc",
++      "remote_gzipper_worker.h",
++    ]
++    deps = [
++      ":remote_gzipper_protocol",
++      "//base",
++      "//mojo/public/cpp/base",
++      "//net",
++      "//services/data_decoder:lib",
++    ]
++  }
++
++  executable("distributed_utility_worker") {
++    sources = [ "remote_gzipper_worker_main.cc" ]
++    deps = [
++      ":distributed_utility_worker_lib",
++      "//base",
++      "//net",
++    ]
++  }
++
++  source_set("distributed_utility_worker_tests") {
++    testonly = true
++    sources = [ "remote_gzipper_worker_unittest.cc" ]
++    deps = [
++      ":distributed_utility_worker_lib",
++      "//base",
++      "//base/test:test_support",
++      "//mojo/public/cpp/base",
++      "//net",
++      "//net:test_support",
++      "//services/data_decoder:lib",
++      "//testing/gtest",
++    ]
++  }
++}
+diff --git a/content/distributed/REMOTE_GZIPPER_PROTOCOL.md b/content/distributed/REMOTE_GZIPPER_PROTOCOL.md
+new file mode 100644
+index 00000000..f9a2e4c7
+--- /dev/null
++++ b/content/distributed/REMOTE_GZIPPER_PROTOCOL.md
+@@ -0,0 +1,107 @@
++# Remote Gzipper protocol, version 1
++
++Version 1 carries only `data_decoder.mojom.Gzipper::Deflate` between the macOS
++Chromium browser process and a Debian worker reachable through Tailscale. It
++carries raw bytes only: Mojo messages and Mojo handles never cross the network.
++
++A connection carries exactly one request and one response, then closes. The
++client allows one outstanding request and uses Chromium asynchronous DNS and
++TCP APIs. This version has no connection reuse or multiplexing.
++
++## Transport requirements
++
++- Bind the worker only to a Tailscale address or another explicitly private
++  interface. Do not expose this protocol publicly.
++- Chromium requires a host-and-port endpoint, an enable switch, and a readable,
++  non-empty token file before it attempts a connection.
++- The token is authentication data, not a loggable diagnostic. Neither browser
++  nor worker may log the token or request/response payload bytes.
++- Separate 10-second connection and request timers cover DNS/connect and
++  write/read work. Timeout, disconnect, authentication, protocol, or worker
++  failures make Chromium use the local Data Decoder for that request.
++
++## Encoding
++
++All integer fields are unsigned and big-endian. `UCD1` is the magic value and
++the protocol version is `1`. Receivers must consume exactly one complete frame;
++bad magic, version, reserved byte, length, or trailing bytes are malformed.
++
++### Request
++
++| Field | Bytes | Value |
++| --- | ---: | --- |
++| magic | 4 | ASCII `UCD1` |
++| version | 2 | `1` |
++| operation ID | 1 | `1` for `Gzipper::Deflate` |
++| reserved | 1 | `0` |
++| request ID | 8 | Browser-generated nonzero value |
++| authentication length | 4 | Number of authentication-data bytes |
++| payload length | 8 | Number of binary input bytes |
++| authentication data | variable | Required non-empty token bytes |
++| payload | variable | Binary Deflate input |
++
++The fixed request header is 28 bytes. Authentication data is limited to 4 KiB;
++payload data is limited to 64 MiB. Other operation IDs are parsed only so the
++worker can return the explicit `unsupported operation` failure below.
++
++### Response
++
++| Field | Bytes | Value |
++| --- | ---: | --- |
++| magic | 4 | ASCII `UCD1` |
++| version | 2 | `1` |
++| status | 1 | `1` success or `2` failure |
++| reserved | 1 | `0` |
++| request ID | 8 | The request's ID |
++| error code | 4 | `0` only on success; nonzero on failure |
++| payload length | 8 | Number of binary result bytes |
++| payload | variable | Binary Deflate output or optional failure bytes |
++
++The fixed response header is 28 bytes. A success response has error code `0`.
++A failure response must have a nonzero error code and must not contain partial
++Deflate output.
++
++## Validation and errors
++
++Before Deflate, the worker validates a parsed request in this order:
++
++1. Empty authentication data: error `1` (`missing authentication`).
++2. Missing expected token or unequal token: error `2` (`authentication failed`).
++3. Any operation ID other than `1`: error `3` (`unsupported operation`).
++
++A worker sends a failure response with the same request ID and the corresponding
++error code. Code `4` is malformed frame, `5` is oversized payload, and `6` is
++an internal worker error. Chromium accepts a response only when its request ID
++matches the request; a mismatched, malformed, or otherwise invalid response
++causes local fallback.
++
++## Production worker
++
++The production implementation is the Chromium GN target
++`//content/distributed:distributed_utility_worker`. It is defined only for
++Linux x86_64 and calls Chromium's existing `data_decoder::Gzipper::Deflate`
++implementation. Build it from the same Chromium revision as the macOS browser:
++
++```sh
++gn gen out/distributed-worker --args='target_os="linux" target_cpu="x64"'
++autoninja -C out/distributed-worker distributed_utility_worker
++```
++
++Create a token file readable only by the worker account, then bind the worker
++to the Debian machine's Tailscale address:
++
++```sh
++out/distributed-worker/distributed_utility_worker \
++  --listen-host=100.x.y.z \
++  --listen-port=8765 \
++  --token-file=/run/secrets/distributed-utility-token
++```
++
++The executable rejects wildcard addresses and empty or unreadable token files.
++SIGTERM and SIGINT stop accepting work, disconnect the active request, and exit
++the asynchronous event loop cleanly. It logs startup or configuration errors
++only; authentication data and request/response payloads are never logged.
++
++The repository's `distributed-worker/` Python implementation is a
++non-production development harness for protocol experiments. It is not the
++worker deployed with Chromium.
+diff --git a/content/distributed/distributed_utility_proxy.cc b/content/distributed/distributed_utility_proxy.cc
+new file mode 100644
+index 00000000..952abc27
 --- /dev/null
 +++ b/content/distributed/distributed_utility_proxy.cc
 @@ -0,0 +1,78 @@
@@ -202,6 +362,9 @@
 +}
 +
 +}  // namespace content::distributed
+diff --git a/content/distributed/distributed_utility_proxy.h b/content/distributed/distributed_utility_proxy.h
+new file mode 100644
+index 00000000..489cd688
 --- /dev/null
 +++ b/content/distributed/distributed_utility_proxy.h
 @@ -0,0 +1,46 @@
@@ -251,89 +414,9 @@
 +}  // namespace content::distributed
 +
 +#endif  // CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_PROXY_H_
---- /dev/null
-+++ b/content/distributed/remote_gzipper_protocol.h
-@@ -0,0 +1,80 @@
-+// Copyright 2026 The Chromium Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#ifndef CONTENT_DISTRIBUTED_REMOTE_GZIPPER_PROTOCOL_H_
-+#define CONTENT_DISTRIBUTED_REMOTE_GZIPPER_PROTOCOL_H_
-+
-+#include <cstdint>
-+#include <optional>
-+#include <string>
-+#include <string_view>
-+
-+namespace content::distributed {
-+
-+constexpr uint64_t kRemoteGzipperMaxPayloadSize = 64u * 1024u * 1024u;
-+constexpr uint32_t kRemoteGzipperMaxAuthenticationDataSize = 4096;
-+
-+// Version 1 supports only data_decoder.mojom.Gzipper::Deflate.
-+enum class RemoteGzipperOperation : uint8_t {
-+  kDeflate = 1,
-+};
-+
-+enum class RemoteGzipperStatus : uint8_t {
-+  kSuccess = 1,
-+  kFailure = 2,
-+};
-+
-+enum class RemoteGzipperError : uint32_t {
-+  kNone = 0,
-+  kMissingAuthentication = 1,
-+  kAuthenticationFailed = 2,
-+  kUnsupportedOperation = 3,
-+  kMalformedFrame = 4,
-+  kOversizedPayload = 5,
-+  kInternal = 6,
-+};
-+
-+struct RemoteGzipperRequest {
-+  uint64_t request_id;
-+  uint8_t operation_id;
-+  std::string authentication_data;
-+  std::string payload;
-+};
-+
-+struct RemoteGzipperResponse {
-+  uint64_t request_id;
-+  RemoteGzipperStatus status;
-+  RemoteGzipperError error;
-+  std::string payload;
-+};
-+
-+std::optional<std::string> SerializeRemoteGzipperRequest(
-+    const RemoteGzipperRequest& request);
-+
-+std::optional<RemoteGzipperRequest> ParseRemoteGzipperRequest(
-+    std::string_view serialized_request);
-+
-+std::optional<std::string> SerializeRemoteGzipperResponse(
-+    const RemoteGzipperResponse& response);
-+
-+std::optional<RemoteGzipperResponse> ParseRemoteGzipperResponse(
-+    std::string_view serialized_response);
-+
-+// Validates request authentication and returns an explicit worker response
-+// error. A worker must return this error in a failure response without logging
-+// the supplied authentication data.
-+RemoteGzipperError ValidateRemoteGzipperRequest(
-+    const RemoteGzipperRequest& request,
-+    std::string_view expected_authentication_data);
-+
-+RemoteGzipperResponse MakeRemoteGzipperFailureResponse(
-+    uint64_t request_id,
-+    RemoteGzipperError error);
-+
-+bool IsRemoteGzipperResponseForRequest(const RemoteGzipperRequest& request,
-+                                       const RemoteGzipperResponse& response);
-+
-+}  // namespace content::distributed
-+
-+#endif  // CONTENT_DISTRIBUTED_REMOTE_GZIPPER_PROTOCOL_H_
+diff --git a/content/distributed/remote_data_decoder_service.cc b/content/distributed/remote_data_decoder_service.cc
+new file mode 100644
+index 00000000..ed5e8cf2
 --- /dev/null
 +++ b/content/distributed/remote_data_decoder_service.cc
 @@ -0,0 +1,159 @@
@@ -496,322 +579,9 @@
 +}
 +
 +}  // namespace content::distributed
---- /dev/null
-+++ b/content/distributed/remote_gzipper_protocol.cc
-@@ -0,0 +1,207 @@
-+// Copyright 2026 The Chromium Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#include "content/distributed/remote_gzipper_protocol.h"
-+
-+namespace content::distributed {
-+
-+namespace {
-+
-+constexpr char kMagic[] = "UCD1";
-+constexpr uint16_t kProtocolVersion = 1;
-+constexpr size_t kRequestHeaderSize = 28;
-+constexpr size_t kResponseHeaderSize = 28;
-+
-+void AppendUint16(uint16_t value, std::string* output) {
-+  output->push_back(static_cast<char>((value >> 8) & 0xff));
-+  output->push_back(static_cast<char>(value & 0xff));
-+}
-+
-+void AppendUint32(uint32_t value, std::string* output) {
-+  for (int shift = 24; shift >= 0; shift -= 8) {
-+    output->push_back(static_cast<char>((value >> shift) & 0xff));
-+  }
-+}
-+
-+void AppendUint64(uint64_t value, std::string* output) {
-+  for (int shift = 56; shift >= 0; shift -= 8) {
-+    output->push_back(static_cast<char>((value >> shift) & 0xff));
-+  }
-+}
-+
-+uint16_t ReadUint16(std::string_view input, size_t offset) {
-+  return (static_cast<uint16_t>(static_cast<unsigned char>(input[offset]))
-+          << 8) |
-+         static_cast<unsigned char>(input[offset + 1]);
-+}
-+
-+uint32_t ReadUint32(std::string_view input, size_t offset) {
-+  uint32_t value = 0;
-+  for (size_t index = 0; index < sizeof(value); ++index) {
-+    value = (value << 8) | static_cast<unsigned char>(input[offset + index]);
-+  }
-+  return value;
-+}
-+
-+uint64_t ReadUint64(std::string_view input, size_t offset) {
-+  uint64_t value = 0;
-+  for (size_t index = 0; index < sizeof(value); ++index) {
-+    value = (value << 8) | static_cast<unsigned char>(input[offset + index]);
-+  }
-+  return value;
-+}
-+
-+bool IsValidStatus(RemoteGzipperStatus status) {
-+  return status == RemoteGzipperStatus::kSuccess ||
-+         status == RemoteGzipperStatus::kFailure;
-+}
-+
-+bool IsValidError(RemoteGzipperError error) {
-+  return error >= RemoteGzipperError::kNone &&
-+         error <= RemoteGzipperError::kInternal;
-+}
-+
-+}  // namespace
-+
-+std::optional<std::string> SerializeRemoteGzipperRequest(
-+    const RemoteGzipperRequest& request) {
-+  if (request.request_id == 0 || request.authentication_data.empty() ||
-+      request.authentication_data.size() >
-+          kRemoteGzipperMaxAuthenticationDataSize ||
-+      request.payload.size() > kRemoteGzipperMaxPayloadSize) {
-+    return std::nullopt;
-+  }
-+
-+  std::string output;
-+  output.reserve(kRequestHeaderSize + request.authentication_data.size() +
-+                 request.payload.size());
-+  output.append(kMagic, sizeof(kMagic) - 1);
-+  AppendUint16(kProtocolVersion, &output);
-+  output.push_back(static_cast<char>(request.operation_id));
-+  output.push_back(0);
-+  AppendUint64(request.request_id, &output);
-+  AppendUint32(request.authentication_data.size(), &output);
-+  AppendUint64(request.payload.size(), &output);
-+  output.append(request.authentication_data);
-+  output.append(request.payload);
-+  return output;
-+}
-+
-+std::optional<RemoteGzipperRequest> ParseRemoteGzipperRequest(
-+    std::string_view serialized_request) {
-+  if (serialized_request.size() < kRequestHeaderSize ||
-+      serialized_request.substr(0, 4) != std::string_view(kMagic, 4) ||
-+      ReadUint16(serialized_request, 4) != kProtocolVersion ||
-+      serialized_request[7] != 0) {
-+    return std::nullopt;
-+  }
-+
-+  const uint64_t request_id = ReadUint64(serialized_request, 8);
-+  const uint32_t authentication_size = ReadUint32(serialized_request, 16);
-+  const uint64_t payload_size = ReadUint64(serialized_request, 20);
-+  if (request_id == 0 ||
-+      authentication_size > kRemoteGzipperMaxAuthenticationDataSize ||
-+      payload_size > kRemoteGzipperMaxPayloadSize ||
-+      authentication_size + payload_size !=
-+          serialized_request.size() - kRequestHeaderSize) {
-+    return std::nullopt;
-+  }
-+
-+  return RemoteGzipperRequest{
-+      request_id, static_cast<uint8_t>(serialized_request[6]),
-+      std::string(
-+          serialized_request.substr(kRequestHeaderSize, authentication_size)),
-+      std::string(
-+          serialized_request.substr(kRequestHeaderSize + authentication_size))};
-+}
-+
-+std::optional<std::string> SerializeRemoteGzipperResponse(
-+    const RemoteGzipperResponse& response) {
-+  if (response.request_id == 0 || !IsValidStatus(response.status) ||
-+      !IsValidError(response.error) ||
-+      response.payload.size() > kRemoteGzipperMaxPayloadSize ||
-+      (response.status == RemoteGzipperStatus::kSuccess &&
-+       response.error != RemoteGzipperError::kNone) ||
-+      (response.status == RemoteGzipperStatus::kFailure &&
-+       response.error == RemoteGzipperError::kNone)) {
-+    return std::nullopt;
-+  }
-+
-+  std::string output;
-+  output.reserve(kResponseHeaderSize + response.payload.size());
-+  output.append(kMagic, sizeof(kMagic) - 1);
-+  AppendUint16(kProtocolVersion, &output);
-+  output.push_back(static_cast<char>(response.status));
-+  output.push_back(0);
-+  AppendUint64(response.request_id, &output);
-+  AppendUint32(static_cast<uint32_t>(response.error), &output);
-+  AppendUint64(response.payload.size(), &output);
-+  output.append(response.payload);
-+  return output;
-+}
-+
-+std::optional<RemoteGzipperResponse> ParseRemoteGzipperResponse(
-+    std::string_view serialized_response) {
-+  if (serialized_response.size() < kResponseHeaderSize ||
-+      serialized_response.substr(0, 4) != std::string_view(kMagic, 4) ||
-+      ReadUint16(serialized_response, 4) != kProtocolVersion ||
-+      serialized_response[7] != 0) {
-+    return std::nullopt;
-+  }
-+
-+  const auto status = static_cast<RemoteGzipperStatus>(
-+      static_cast<unsigned char>(serialized_response[6]));
-+  const uint64_t request_id = ReadUint64(serialized_response, 8);
-+  const auto error =
-+      static_cast<RemoteGzipperError>(ReadUint32(serialized_response, 16));
-+  const uint64_t payload_size = ReadUint64(serialized_response, 20);
-+  if (request_id == 0 || !IsValidStatus(status) || !IsValidError(error) ||
-+      payload_size > kRemoteGzipperMaxPayloadSize ||
-+      payload_size != serialized_response.size() - kResponseHeaderSize ||
-+      (status == RemoteGzipperStatus::kSuccess &&
-+       error != RemoteGzipperError::kNone) ||
-+      (status == RemoteGzipperStatus::kFailure &&
-+       error == RemoteGzipperError::kNone)) {
-+    return std::nullopt;
-+  }
-+
-+  return RemoteGzipperResponse{
-+      request_id, status, error,
-+      std::string(serialized_response.substr(kResponseHeaderSize))};
-+}
-+
-+RemoteGzipperError ValidateRemoteGzipperRequest(
-+    const RemoteGzipperRequest& request,
-+    std::string_view expected_authentication_data) {
-+  if (request.authentication_data.empty()) {
-+    return RemoteGzipperError::kMissingAuthentication;
-+  }
-+  if (expected_authentication_data.empty() ||
-+      request.authentication_data != expected_authentication_data) {
-+    return RemoteGzipperError::kAuthenticationFailed;
-+  }
-+  if (request.operation_id !=
-+      static_cast<uint8_t>(RemoteGzipperOperation::kDeflate)) {
-+    return RemoteGzipperError::kUnsupportedOperation;
-+  }
-+  return RemoteGzipperError::kNone;
-+}
-+
-+RemoteGzipperResponse MakeRemoteGzipperFailureResponse(
-+    uint64_t request_id,
-+    RemoteGzipperError error) {
-+  return RemoteGzipperResponse{request_id, RemoteGzipperStatus::kFailure, error,
-+                               std::string()};
-+}
-+
-+bool IsRemoteGzipperResponseForRequest(const RemoteGzipperRequest& request,
-+                                       const RemoteGzipperResponse& response) {
-+  return response.request_id == request.request_id &&
-+         ((response.status == RemoteGzipperStatus::kSuccess &&
-+           response.error == RemoteGzipperError::kNone) ||
-+          (response.status == RemoteGzipperStatus::kFailure &&
-+           response.error != RemoteGzipperError::kNone));
-+}
-+
-+}  // namespace content::distributed
---- /dev/null
-+++ b/content/distributed/remote_gzipper_client.h
-@@ -0,0 +1,103 @@
-+// Copyright 2026 The Chromium Authors
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
-+
-+#ifndef CONTENT_DISTRIBUTED_REMOTE_GZIPPER_CLIENT_H_
-+#define CONTENT_DISTRIBUTED_REMOTE_GZIPPER_CLIENT_H_
-+
-+#include <cstdint>
-+#include <memory>
-+#include <string>
-+
-+#include "base/functional/callback.h"
-+#include "base/memory/ref_counted.h"
-+#include "base/memory/weak_ptr.h"
-+#include "base/time/time.h"
-+#include "base/timer/timer.h"
-+#include "content/distributed/remote_gzipper_protocol.h"
-+#include "net/dns/host_resolver.h"
-+
-+namespace net {
-+class DrainableIOBuffer;
-+class IOBufferWithSize;
-+class StreamSocket;
-+}  // namespace net
-+
-+namespace content::distributed {
-+
-+enum class RemoteGzipperOutcome {
-+  kSuccess,
-+  kTimeout,
-+  kDisconnect,
-+  kAuthenticationFailure,
-+  kMalformedResponse,
-+  kUnsupportedOperation,
-+  kWorkerFailure,
-+  kBusy,
-+};
-+
-+struct RemoteGzipperResult {
-+  RemoteGzipperOutcome outcome;
-+  std::string payload;
-+};
-+
-+// Performs one fully asynchronous remote Gzipper exchange. All DNS, connect,
-+// write, and read work uses Chromium net APIs on the calling sequence.
-+class RemoteGzipperClient {
-+ public:
-+  using ResponseCallback = base::OnceCallback<void(RemoteGzipperResult)>;
-+
-+  RemoteGzipperClient(std::string worker_endpoint,
-+                      std::string authentication_data,
-+                      base::TimeDelta connection_timeout = base::Seconds(10),
-+                      base::TimeDelta request_timeout = base::Seconds(10));
-+  RemoteGzipperClient(const RemoteGzipperClient&) = delete;
-+  RemoteGzipperClient& operator=(const RemoteGzipperClient&) = delete;
-+  ~RemoteGzipperClient();
-+
-+  void Send(RemoteGzipperRequest request, ResponseCallback callback);
-+  bool request_in_flight_for_testing() const { return request_in_flight_; }
-+  void SetHostResolverForTesting(std::unique_ptr<net::HostResolver> resolver);
-+
-+ private:
-+  struct WorkerEndpoint {
-+    std::string host;
-+    uint16_t port;
-+  };
-+
-+  void OnConnectionTimeout();
-+  void OnRequestTimeout();
-+  void OnResolveComplete(int result);
-+  void StartConnect();
-+  void OnConnectComplete(int result);
-+  void WriteRequest();
-+  void OnWriteComplete(int result);
-+  void ReadResponse();
-+  void OnReadComplete(int result);
-+  void CompleteResponse();
-+  void Finish(RemoteGzipperOutcome outcome, std::string payload = {});
-+  void ResetOperation();
-+
-+  const std::string worker_endpoint_text_;
-+  const std::string authentication_data_;
-+  const base::TimeDelta connection_timeout_;
-+  const base::TimeDelta request_timeout_;
-+
-+  bool request_in_flight_ = false;
-+  WorkerEndpoint worker_endpoint_;
-+  RemoteGzipperRequest request_;
-+  ResponseCallback callback_;
-+  std::unique_ptr<net::HostResolver> resolver_;
-+  std::unique_ptr<net::HostResolver::ResolveHostRequest> resolve_request_;
-+  std::unique_ptr<net::StreamSocket> socket_;
-+  scoped_refptr<net::DrainableIOBuffer> write_buffer_;
-+  scoped_refptr<net::IOBufferWithSize> read_buffer_;
-+  std::string response_bytes_;
-+  base::OneShotTimer connection_timer_;
-+  base::OneShotTimer request_timer_;
-+  base::WeakPtrFactory<RemoteGzipperClient> weak_factory_{this};
-+};
-+
-+}  // namespace content::distributed
-+
-+#endif  // CONTENT_DISTRIBUTED_REMOTE_GZIPPER_CLIENT_H_
+diff --git a/content/distributed/remote_gzipper_client.cc b/content/distributed/remote_gzipper_client.cc
+new file mode 100644
+index 00000000..1f49cdd6
 --- /dev/null
 +++ b/content/distributed/remote_gzipper_client.cc
 @@ -0,0 +1,332 @@
@@ -1147,6 +917,118 @@
 +}
 +
 +}  // namespace content::distributed
+diff --git a/content/distributed/remote_gzipper_client.h b/content/distributed/remote_gzipper_client.h
+new file mode 100644
+index 00000000..954b2986
+--- /dev/null
++++ b/content/distributed/remote_gzipper_client.h
+@@ -0,0 +1,103 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_DISTRIBUTED_REMOTE_GZIPPER_CLIENT_H_
++#define CONTENT_DISTRIBUTED_REMOTE_GZIPPER_CLIENT_H_
++
++#include <cstdint>
++#include <memory>
++#include <string>
++
++#include "base/functional/callback.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/weak_ptr.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++#include "content/distributed/remote_gzipper_protocol.h"
++#include "net/dns/host_resolver.h"
++
++namespace net {
++class DrainableIOBuffer;
++class IOBufferWithSize;
++class StreamSocket;
++}  // namespace net
++
++namespace content::distributed {
++
++enum class RemoteGzipperOutcome {
++  kSuccess,
++  kTimeout,
++  kDisconnect,
++  kAuthenticationFailure,
++  kMalformedResponse,
++  kUnsupportedOperation,
++  kWorkerFailure,
++  kBusy,
++};
++
++struct RemoteGzipperResult {
++  RemoteGzipperOutcome outcome;
++  std::string payload;
++};
++
++// Performs one fully asynchronous remote Gzipper exchange. All DNS, connect,
++// write, and read work uses Chromium net APIs on the calling sequence.
++class RemoteGzipperClient {
++ public:
++  using ResponseCallback = base::OnceCallback<void(RemoteGzipperResult)>;
++
++  RemoteGzipperClient(std::string worker_endpoint,
++                      std::string authentication_data,
++                      base::TimeDelta connection_timeout = base::Seconds(10),
++                      base::TimeDelta request_timeout = base::Seconds(10));
++  RemoteGzipperClient(const RemoteGzipperClient&) = delete;
++  RemoteGzipperClient& operator=(const RemoteGzipperClient&) = delete;
++  ~RemoteGzipperClient();
++
++  void Send(RemoteGzipperRequest request, ResponseCallback callback);
++  bool request_in_flight_for_testing() const { return request_in_flight_; }
++  void SetHostResolverForTesting(std::unique_ptr<net::HostResolver> resolver);
++
++ private:
++  struct WorkerEndpoint {
++    std::string host;
++    uint16_t port;
++  };
++
++  void OnConnectionTimeout();
++  void OnRequestTimeout();
++  void OnResolveComplete(int result);
++  void StartConnect();
++  void OnConnectComplete(int result);
++  void WriteRequest();
++  void OnWriteComplete(int result);
++  void ReadResponse();
++  void OnReadComplete(int result);
++  void CompleteResponse();
++  void Finish(RemoteGzipperOutcome outcome, std::string payload = {});
++  void ResetOperation();
++
++  const std::string worker_endpoint_text_;
++  const std::string authentication_data_;
++  const base::TimeDelta connection_timeout_;
++  const base::TimeDelta request_timeout_;
++
++  bool request_in_flight_ = false;
++  WorkerEndpoint worker_endpoint_;
++  RemoteGzipperRequest request_;
++  ResponseCallback callback_;
++  std::unique_ptr<net::HostResolver> resolver_;
++  std::unique_ptr<net::HostResolver::ResolveHostRequest> resolve_request_;
++  std::unique_ptr<net::StreamSocket> socket_;
++  scoped_refptr<net::DrainableIOBuffer> write_buffer_;
++  scoped_refptr<net::IOBufferWithSize> read_buffer_;
++  std::string response_bytes_;
++  base::OneShotTimer connection_timer_;
++  base::OneShotTimer request_timer_;
++  base::WeakPtrFactory<RemoteGzipperClient> weak_factory_{this};
++};
++
++}  // namespace content::distributed
++
++#endif  // CONTENT_DISTRIBUTED_REMOTE_GZIPPER_CLIENT_H_
+diff --git a/content/distributed/remote_gzipper_client_unittest.cc b/content/distributed/remote_gzipper_client_unittest.cc
+new file mode 100644
+index 00000000..9952f1de
 --- /dev/null
 +++ b/content/distributed/remote_gzipper_client_unittest.cc
 @@ -0,0 +1,328 @@
@@ -1478,9 +1360,353 @@
 +
 +}  // namespace
 +}  // namespace content::distributed
+diff --git a/content/distributed/remote_gzipper_protocol.cc b/content/distributed/remote_gzipper_protocol.cc
+new file mode 100644
+index 00000000..323672e6
+--- /dev/null
++++ b/content/distributed/remote_gzipper_protocol.cc
+@@ -0,0 +1,228 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/distributed/remote_gzipper_protocol.h"
++
++namespace content::distributed {
++
++namespace {
++
++constexpr char kMagic[] = "UCD1";
++constexpr uint16_t kProtocolVersion = 1;
++constexpr size_t kResponseHeaderSize = 28;
++
++void AppendUint16(uint16_t value, std::string* output) {
++  output->push_back(static_cast<char>((value >> 8) & 0xff));
++  output->push_back(static_cast<char>(value & 0xff));
++}
++
++void AppendUint32(uint32_t value, std::string* output) {
++  for (int shift = 24; shift >= 0; shift -= 8) {
++    output->push_back(static_cast<char>((value >> shift) & 0xff));
++  }
++}
++
++void AppendUint64(uint64_t value, std::string* output) {
++  for (int shift = 56; shift >= 0; shift -= 8) {
++    output->push_back(static_cast<char>((value >> shift) & 0xff));
++  }
++}
++
++uint16_t ReadUint16(std::string_view input, size_t offset) {
++  return (static_cast<uint16_t>(static_cast<unsigned char>(input[offset]))
++          << 8) |
++         static_cast<unsigned char>(input[offset + 1]);
++}
++
++uint32_t ReadUint32(std::string_view input, size_t offset) {
++  uint32_t value = 0;
++  for (size_t index = 0; index < sizeof(value); ++index) {
++    value = (value << 8) | static_cast<unsigned char>(input[offset + index]);
++  }
++  return value;
++}
++
++uint64_t ReadUint64(std::string_view input, size_t offset) {
++  uint64_t value = 0;
++  for (size_t index = 0; index < sizeof(value); ++index) {
++    value = (value << 8) | static_cast<unsigned char>(input[offset + index]);
++  }
++  return value;
++}
++
++bool IsValidStatus(RemoteGzipperStatus status) {
++  return status == RemoteGzipperStatus::kSuccess ||
++         status == RemoteGzipperStatus::kFailure;
++}
++
++bool IsValidError(RemoteGzipperError error) {
++  return error >= RemoteGzipperError::kNone &&
++         error <= RemoteGzipperError::kInternal;
++}
++
++}  // namespace
++
++std::optional<std::string> SerializeRemoteGzipperRequest(
++    const RemoteGzipperRequest& request) {
++  if (request.request_id == 0 || request.authentication_data.empty() ||
++      request.authentication_data.size() >
++          kRemoteGzipperMaxAuthenticationDataSize ||
++      request.payload.size() > kRemoteGzipperMaxPayloadSize) {
++    return std::nullopt;
++  }
++
++  std::string output;
++  output.reserve(kRemoteGzipperRequestHeaderSize +
++                 request.authentication_data.size() + request.payload.size());
++  output.append(kMagic, sizeof(kMagic) - 1);
++  AppendUint16(kProtocolVersion, &output);
++  output.push_back(static_cast<char>(request.operation_id));
++  output.push_back(0);
++  AppendUint64(request.request_id, &output);
++  AppendUint32(request.authentication_data.size(), &output);
++  AppendUint64(request.payload.size(), &output);
++  output.append(request.authentication_data);
++  output.append(request.payload);
++  return output;
++}
++
++std::optional<RemoteGzipperRequest> ParseRemoteGzipperRequest(
++    std::string_view serialized_request) {
++  const auto frame_info = InspectRemoteGzipperRequestFrame(serialized_request);
++  if (frame_info.state != RemoteGzipperFrameState::kComplete) {
++    return std::nullopt;
++  }
++
++  const uint32_t authentication_size = ReadUint32(serialized_request, 16);
++  return RemoteGzipperRequest{
++      frame_info.request_id, static_cast<uint8_t>(serialized_request[6]),
++      std::string(serialized_request.substr(kRemoteGzipperRequestHeaderSize,
++                                            authentication_size)),
++      std::string(serialized_request.substr(kRemoteGzipperRequestHeaderSize +
++                                            authentication_size))};
++}
++
++RemoteGzipperRequestFrameInfo InspectRemoteGzipperRequestFrame(
++    std::string_view serialized_request) {
++  if (serialized_request.size() < kRemoteGzipperRequestHeaderSize) {
++    return {RemoteGzipperFrameState::kIncomplete, 0, 0};
++  }
++
++  const uint64_t request_id = ReadUint64(serialized_request, 8);
++  if (serialized_request.substr(0, 4) != std::string_view(kMagic, 4) ||
++      ReadUint16(serialized_request, 4) != kProtocolVersion ||
++      serialized_request[7] != 0 || request_id == 0) {
++    return {RemoteGzipperFrameState::kMalformed, request_id, 0};
++  }
++
++  const uint32_t authentication_size = ReadUint32(serialized_request, 16);
++  const uint64_t payload_size = ReadUint64(serialized_request, 20);
++  if (payload_size > kRemoteGzipperMaxPayloadSize) {
++    return {RemoteGzipperFrameState::kOversized, request_id, 0};
++  }
++  if (authentication_size > kRemoteGzipperMaxAuthenticationDataSize) {
++    return {RemoteGzipperFrameState::kMalformed, request_id, 0};
++  }
++
++  const size_t frame_size = kRemoteGzipperRequestHeaderSize +
++                            authentication_size +
++                            static_cast<size_t>(payload_size);
++  if (serialized_request.size() < frame_size) {
++    return {RemoteGzipperFrameState::kIncomplete, request_id, frame_size};
++  }
++  if (serialized_request.size() > frame_size) {
++    return {RemoteGzipperFrameState::kMalformed, request_id, frame_size};
++  }
++  return {RemoteGzipperFrameState::kComplete, request_id, frame_size};
++}
++
++std::optional<std::string> SerializeRemoteGzipperResponse(
++    const RemoteGzipperResponse& response) {
++  if (response.request_id == 0 || !IsValidStatus(response.status) ||
++      !IsValidError(response.error) ||
++      response.payload.size() > kRemoteGzipperMaxPayloadSize ||
++      (response.status == RemoteGzipperStatus::kSuccess &&
++       response.error != RemoteGzipperError::kNone) ||
++      (response.status == RemoteGzipperStatus::kFailure &&
++       response.error == RemoteGzipperError::kNone)) {
++    return std::nullopt;
++  }
++
++  std::string output;
++  output.reserve(kResponseHeaderSize + response.payload.size());
++  output.append(kMagic, sizeof(kMagic) - 1);
++  AppendUint16(kProtocolVersion, &output);
++  output.push_back(static_cast<char>(response.status));
++  output.push_back(0);
++  AppendUint64(response.request_id, &output);
++  AppendUint32(static_cast<uint32_t>(response.error), &output);
++  AppendUint64(response.payload.size(), &output);
++  output.append(response.payload);
++  return output;
++}
++
++std::optional<RemoteGzipperResponse> ParseRemoteGzipperResponse(
++    std::string_view serialized_response) {
++  if (serialized_response.size() < kResponseHeaderSize ||
++      serialized_response.substr(0, 4) != std::string_view(kMagic, 4) ||
++      ReadUint16(serialized_response, 4) != kProtocolVersion ||
++      serialized_response[7] != 0) {
++    return std::nullopt;
++  }
++
++  const auto status = static_cast<RemoteGzipperStatus>(
++      static_cast<unsigned char>(serialized_response[6]));
++  const uint64_t request_id = ReadUint64(serialized_response, 8);
++  const auto error =
++      static_cast<RemoteGzipperError>(ReadUint32(serialized_response, 16));
++  const uint64_t payload_size = ReadUint64(serialized_response, 20);
++  if (request_id == 0 || !IsValidStatus(status) || !IsValidError(error) ||
++      payload_size > kRemoteGzipperMaxPayloadSize ||
++      payload_size != serialized_response.size() - kResponseHeaderSize ||
++      (status == RemoteGzipperStatus::kSuccess &&
++       error != RemoteGzipperError::kNone) ||
++      (status == RemoteGzipperStatus::kFailure &&
++       error == RemoteGzipperError::kNone)) {
++    return std::nullopt;
++  }
++
++  return RemoteGzipperResponse{
++      request_id, status, error,
++      std::string(serialized_response.substr(kResponseHeaderSize))};
++}
++
++RemoteGzipperError ValidateRemoteGzipperRequest(
++    const RemoteGzipperRequest& request,
++    std::string_view expected_authentication_data) {
++  if (request.authentication_data.empty()) {
++    return RemoteGzipperError::kMissingAuthentication;
++  }
++  if (expected_authentication_data.empty() ||
++      request.authentication_data != expected_authentication_data) {
++    return RemoteGzipperError::kAuthenticationFailed;
++  }
++  if (request.operation_id !=
++      static_cast<uint8_t>(RemoteGzipperOperation::kDeflate)) {
++    return RemoteGzipperError::kUnsupportedOperation;
++  }
++  return RemoteGzipperError::kNone;
++}
++
++RemoteGzipperResponse MakeRemoteGzipperFailureResponse(
++    uint64_t request_id,
++    RemoteGzipperError error) {
++  return RemoteGzipperResponse{request_id, RemoteGzipperStatus::kFailure, error,
++                               std::string()};
++}
++
++bool IsRemoteGzipperResponseForRequest(const RemoteGzipperRequest& request,
++                                       const RemoteGzipperResponse& response) {
++  return response.request_id == request.request_id &&
++         ((response.status == RemoteGzipperStatus::kSuccess &&
++           response.error == RemoteGzipperError::kNone) ||
++          (response.status == RemoteGzipperStatus::kFailure &&
++           response.error != RemoteGzipperError::kNone));
++}
++
++}  // namespace content::distributed
+diff --git a/content/distributed/remote_gzipper_protocol.h b/content/distributed/remote_gzipper_protocol.h
+new file mode 100644
+index 00000000..9c8e7186
+--- /dev/null
++++ b/content/distributed/remote_gzipper_protocol.h
+@@ -0,0 +1,101 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_DISTRIBUTED_REMOTE_GZIPPER_PROTOCOL_H_
++#define CONTENT_DISTRIBUTED_REMOTE_GZIPPER_PROTOCOL_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace content::distributed {
++
++constexpr uint64_t kRemoteGzipperMaxPayloadSize = 64u * 1024u * 1024u;
++constexpr uint32_t kRemoteGzipperMaxAuthenticationDataSize = 4096;
++constexpr size_t kRemoteGzipperRequestHeaderSize = 28;
++
++// Version 1 supports only data_decoder.mojom.Gzipper::Deflate.
++enum class RemoteGzipperOperation : uint8_t {
++  kDeflate = 1,
++};
++
++enum class RemoteGzipperStatus : uint8_t {
++  kSuccess = 1,
++  kFailure = 2,
++};
++
++enum class RemoteGzipperError : uint32_t {
++  kNone = 0,
++  kMissingAuthentication = 1,
++  kAuthenticationFailed = 2,
++  kUnsupportedOperation = 3,
++  kMalformedFrame = 4,
++  kOversizedPayload = 5,
++  kInternal = 6,
++};
++
++struct RemoteGzipperRequest {
++  uint64_t request_id;
++  uint8_t operation_id;
++  std::string authentication_data;
++  std::string payload;
++};
++
++struct RemoteGzipperResponse {
++  uint64_t request_id;
++  RemoteGzipperStatus status;
++  RemoteGzipperError error;
++  std::string payload;
++};
++
++enum class RemoteGzipperFrameState {
++  kIncomplete,
++  kComplete,
++  kMalformed,
++  kOversized,
++};
++
++// Describes enough of a request frame for a streaming server to know when to
++// continue reading or send an explicit protocol failure. `request_id` is
++// populated whenever a complete fixed header contains a nonzero ID.
++struct RemoteGzipperRequestFrameInfo {
++  RemoteGzipperFrameState state;
++  uint64_t request_id;
++  size_t frame_size;
++};
++
++RemoteGzipperRequestFrameInfo InspectRemoteGzipperRequestFrame(
++    std::string_view serialized_request);
++
++std::optional<std::string> SerializeRemoteGzipperRequest(
++    const RemoteGzipperRequest& request);
++
++std::optional<RemoteGzipperRequest> ParseRemoteGzipperRequest(
++    std::string_view serialized_request);
++
++std::optional<std::string> SerializeRemoteGzipperResponse(
++    const RemoteGzipperResponse& response);
++
++std::optional<RemoteGzipperResponse> ParseRemoteGzipperResponse(
++    std::string_view serialized_response);
++
++// Validates request authentication and returns an explicit worker response
++// error. A worker must return this error in a failure response without logging
++// the supplied authentication data.
++RemoteGzipperError ValidateRemoteGzipperRequest(
++    const RemoteGzipperRequest& request,
++    std::string_view expected_authentication_data);
++
++RemoteGzipperResponse MakeRemoteGzipperFailureResponse(
++    uint64_t request_id,
++    RemoteGzipperError error);
++
++bool IsRemoteGzipperResponseForRequest(const RemoteGzipperRequest& request,
++                                       const RemoteGzipperResponse& response);
++
++}  // namespace content::distributed
++
++#endif  // CONTENT_DISTRIBUTED_REMOTE_GZIPPER_PROTOCOL_H_
+diff --git a/content/distributed/remote_gzipper_protocol_unittest.cc b/content/distributed/remote_gzipper_protocol_unittest.cc
+new file mode 100644
+index 00000000..91530360
 --- /dev/null
 +++ b/content/distributed/remote_gzipper_protocol_unittest.cc
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,133 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1561,6 +1787,37 @@
 +  // Request payload length is the 8-byte unsigned integer at byte 20.
 +  (*serialized)[20] = static_cast<char>(1);
 +  EXPECT_FALSE(ParseRemoteGzipperRequest(*serialized));
++  const auto frame_info = InspectRemoteGzipperRequestFrame(*serialized);
++  EXPECT_EQ(RemoteGzipperFrameState::kOversized, frame_info.state);
++  EXPECT_EQ(42u, frame_info.request_id);
++}
++
++TEST(RemoteGzipperProtocolTest, InspectsFragmentedRequestFrame) {
++  const auto serialized = SerializeRemoteGzipperRequest(MakeRequest());
++  ASSERT_TRUE(serialized);
++
++  auto frame_info = InspectRemoteGzipperRequestFrame(
++      std::string_view(*serialized).substr(0, 12));
++  EXPECT_EQ(RemoteGzipperFrameState::kIncomplete, frame_info.state);
++
++  frame_info = InspectRemoteGzipperRequestFrame(
++      std::string_view(*serialized).substr(0, 28));
++  EXPECT_EQ(RemoteGzipperFrameState::kIncomplete, frame_info.state);
++  EXPECT_EQ(42u, frame_info.request_id);
++  EXPECT_EQ(serialized->size(), frame_info.frame_size);
++
++  frame_info = InspectRemoteGzipperRequestFrame(*serialized);
++  EXPECT_EQ(RemoteGzipperFrameState::kComplete, frame_info.state);
++}
++
++TEST(RemoteGzipperProtocolTest, InspectorReportsTrailingRequestBytes) {
++  auto serialized = SerializeRemoteGzipperRequest(MakeRequest());
++  ASSERT_TRUE(serialized);
++  serialized->push_back('x');
++
++  const auto frame_info = InspectRemoteGzipperRequestFrame(*serialized);
++  EXPECT_EQ(RemoteGzipperFrameState::kMalformed, frame_info.state);
++  EXPECT_EQ(42u, frame_info.request_id);
 +}
 +
 +TEST(RemoteGzipperProtocolTest, RejectsTrailingBytes) {
@@ -1583,82 +1840,753 @@
 +
 +}  // namespace
 +}  // namespace content::distributed
+diff --git a/content/distributed/remote_gzipper_worker.cc b/content/distributed/remote_gzipper_worker.cc
+new file mode 100644
+index 00000000..ed2dff6d
 --- /dev/null
-+++ b/content/distributed/REMOTE_GZIPPER_PROTOCOL.md
-@@ -0,0 +1,76 @@
-+# Remote Gzipper protocol, version 1
++++ b/content/distributed/remote_gzipper_worker.cc
+@@ -0,0 +1,293 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
 +
-+Version 1 carries only `data_decoder.mojom.Gzipper::Deflate` between the macOS
-+Chromium browser process and a Debian worker reachable through Tailscale. It
-+carries raw bytes only: Mojo messages and Mojo handles never cross the network.
++#include "content/distributed/remote_gzipper_worker.h"
 +
-+A connection carries exactly one request and one response, then closes. The
-+client allows one outstanding request and uses Chromium asynchronous DNS and
-+TCP APIs. This version has no connection reuse or multiplexing.
++#include <cstring>
++#include <optional>
++#include <utility>
 +
-+## Transport requirements
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/memory/ref_counted.h"
++#include "base/task/sequenced_task_runner.h"
++#include "content/distributed/remote_gzipper_protocol.h"
++#include "mojo/public/cpp/base/big_buffer.h"
++#include "net/base/io_buffer.h"
++#include "net/base/net_errors.h"
++#include "net/log/net_log_source.h"
++#include "net/socket/stream_socket.h"
++#include "net/socket/tcp_server_socket.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/data_decoder/gzipper.h"
 +
-+- Bind the worker only to a Tailscale address or another explicitly private
-+  interface. Do not expose this protocol publicly.
-+- Chromium requires a host-and-port endpoint, an enable switch, and a readable,
-+  non-empty token file before it attempts a connection.
-+- The token is authentication data, not a loggable diagnostic. Neither browser
-+  nor worker may log the token or request/response payload bytes.
-+- Separate 10-second connection and request timers cover DNS/connect and
-+  write/read work. Timeout, disconnect, authentication, protocol, or worker
-+  failures make Chromium use the local Data Decoder for that request.
++namespace content::distributed {
 +
-+## Encoding
++namespace {
 +
-+All integer fields are unsigned and big-endian. `UCD1` is the magic value and
-+the protocol version is `1`. Receivers must consume exactly one complete frame;
-+bad magic, version, reserved byte, length, or trailing bytes are malformed.
++constexpr int kListenBacklog = 8;
++constexpr int kReadBufferSize = 16 * 1024;
 +
-+### Request
++constexpr net::NetworkTrafficAnnotationTag kResponseTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("distributed_utility_worker_response",
++                                        R"(
++      semantics {
++        sender: "Distributed Utility Worker"
++        description:
++          "Returns the result of an authenticated Gzipper Deflate request to "
++          "an explicitly configured Chromium client."
++        trigger:
++          "Receipt of an authenticated distributed utility request."
++        data: "Binary Deflate output or a payload-free protocol error."
++        destination: OTHER
++      }
++      policy {
++        cookies_allowed: NO
++        setting:
++          "The worker is a separately built, manually started experimental "
++          "executable and is disabled unless explicitly configured."
++        policy_exception_justification:
++          "This experimental fork-only feature has no enterprise policy."
++      })");
 +
-+| Field | Bytes | Value |
-+| --- | ---: | --- |
-+| magic | 4 | ASCII `UCD1` |
-+| version | 2 | `1` |
-+| operation ID | 1 | `1` for `Gzipper::Deflate` |
-+| reserved | 1 | `0` |
-+| request ID | 8 | Browser-generated nonzero value |
-+| authentication length | 4 | Number of authentication-data bytes |
-+| payload length | 8 | Number of binary input bytes |
-+| authentication data | variable | Required non-empty token bytes |
-+| payload | variable | Binary Deflate input |
++mojo_base::BigBuffer ToBigBuffer(const std::string& input) {
++  mojo_base::BigBuffer buffer(input.size());
++  if (!input.empty()) {
++    std::memcpy(buffer.data(), input.data(), input.size());
++  }
++  return buffer;
++}
 +
-+The fixed request header is 28 bytes. Authentication data is limited to 4 KiB;
-+payload data is limited to 64 MiB. Other operation IDs are parsed only so the
-+worker can return the explicit `unsupported operation` failure below.
++std::string ToString(const mojo_base::BigBuffer& input) {
++  if (input.size() == 0) {
++    return std::string();
++  }
++  return std::string(static_cast<const char*>(input.data()), input.size());
++}
 +
-+### Response
++}  // namespace
 +
-+| Field | Bytes | Value |
-+| --- | ---: | --- |
-+| magic | 4 | ASCII `UCD1` |
-+| version | 2 | `1` |
-+| status | 1 | `1` success or `2` failure |
-+| reserved | 1 | `0` |
-+| request ID | 8 | The request's ID |
-+| error code | 4 | `0` only on success; nonzero on failure |
-+| payload length | 8 | Number of binary result bytes |
-+| payload | variable | Binary Deflate output or optional failure bytes |
++class RemoteGzipperWorker::Connection {
++ public:
++  Connection(std::unique_ptr<net::StreamSocket> socket,
++             std::string authentication_data,
++             base::OnceClosure completion_callback)
++      : socket_(std::move(socket)),
++        authentication_data_(std::move(authentication_data)),
++        completion_callback_(std::move(completion_callback)) {}
 +
-+The fixed response header is 28 bytes. A success response has error code `0`.
-+A failure response must have a nonzero error code and must not contain partial
-+Deflate output.
++  Connection(const Connection&) = delete;
++  Connection& operator=(const Connection&) = delete;
++  ~Connection() = default;
 +
-+## Validation and errors
++  void Start() { ReadRequest(); }
 +
-+Before Deflate, the worker validates a parsed request in this order:
++ private:
++  void ReadRequest() {
++    read_buffer_ = base::MakeRefCounted<net::IOBufferWithSize>(kReadBufferSize);
++    const int result = socket_->Read(
++        read_buffer_.get(), read_buffer_->size(),
++        base::BindOnce(&Connection::OnRead, weak_factory_.GetWeakPtr()));
++    if (result != net::ERR_IO_PENDING) {
++      OnRead(result);
++    }
++  }
 +
-+1. Empty authentication data: error `1` (`missing authentication`).
-+2. Missing expected token or unequal token: error `2` (`authentication failed`).
-+3. Any operation ID other than `1`: error `3` (`unsupported operation`).
++  void OnRead(int result) {
++    if (result <= 0) {
++      Complete();
++      return;
++    }
++    request_bytes_.append(read_buffer_->data(), static_cast<size_t>(result));
++    read_buffer_.reset();
 +
-+A worker sends a failure response with the same request ID and the corresponding
-+error code. Code `4` is malformed frame, `5` is oversized payload, and `6` is
-+an internal worker error. Chromium accepts a response only when its request ID
-+matches the request; a mismatched, malformed, or otherwise invalid response
-+causes local fallback.
++    const auto frame_info = InspectRemoteGzipperRequestFrame(request_bytes_);
++    switch (frame_info.state) {
++      case RemoteGzipperFrameState::kIncomplete:
++        ReadRequest();
++        return;
++      case RemoteGzipperFrameState::kMalformed:
++        SendFailure(frame_info.request_id, RemoteGzipperError::kMalformedFrame);
++        return;
++      case RemoteGzipperFrameState::kOversized:
++        SendFailure(frame_info.request_id,
++                    RemoteGzipperError::kOversizedPayload);
++        return;
++      case RemoteGzipperFrameState::kComplete:
++        break;
++    }
++
++    auto request = ParseRemoteGzipperRequest(request_bytes_);
++    if (!request) {
++      SendFailure(frame_info.request_id, RemoteGzipperError::kMalformedFrame);
++      return;
++    }
++    request_id_ = request->request_id;
++    const RemoteGzipperError error =
++        ValidateRemoteGzipperRequest(*request, authentication_data_);
++    if (error != RemoteGzipperError::kNone) {
++      SendFailure(request_id_, error);
++      return;
++    }
++
++    gzipper_.Deflate(
++        ToBigBuffer(request->payload),
++        base::BindOnce(&Connection::OnDeflated, weak_factory_.GetWeakPtr()));
++  }
++
++  void OnDeflated(std::optional<mojo_base::BigBuffer> output) {
++    if (!output) {
++      SendFailure(request_id_, RemoteGzipperError::kInternal);
++      return;
++    }
++    WriteResponse(
++        RemoteGzipperResponse{request_id_, RemoteGzipperStatus::kSuccess,
++                              RemoteGzipperError::kNone, ToString(*output)});
++  }
++
++  void SendFailure(uint64_t request_id, RemoteGzipperError error) {
++    if (request_id == 0) {
++      Complete();
++      return;
++    }
++    WriteResponse(MakeRemoteGzipperFailureResponse(request_id, error));
++  }
++
++  void WriteResponse(RemoteGzipperResponse response) {
++    auto serialized = SerializeRemoteGzipperResponse(response);
++    if (!serialized) {
++      if (response.error != RemoteGzipperError::kInternal) {
++        SendFailure(response.request_id, RemoteGzipperError::kInternal);
++      } else {
++        Complete();
++      }
++      return;
++    }
++
++    auto source =
++        base::MakeRefCounted<net::StringIOBuffer>(std::move(*serialized));
++    const int response_size = source->size();
++    write_buffer_ = base::MakeRefCounted<net::DrainableIOBuffer>(
++        std::move(source), response_size);
++    WriteMore();
++  }
++
++  void WriteMore() {
++    const int result = socket_->Write(
++        write_buffer_.get(), write_buffer_->BytesRemaining(),
++        base::BindOnce(&Connection::OnWrite, weak_factory_.GetWeakPtr()),
++        kResponseTrafficAnnotation);
++    if (result != net::ERR_IO_PENDING) {
++      OnWrite(result);
++    }
++  }
++
++  void OnWrite(int result) {
++    if (result <= 0) {
++      Complete();
++      return;
++    }
++    write_buffer_->DidConsume(result);
++    if (write_buffer_->BytesRemaining() > 0) {
++      WriteMore();
++      return;
++    }
++    Complete();
++  }
++
++  void Complete() {
++    weak_factory_.InvalidateWeakPtrs();
++    if (socket_) {
++      socket_->Disconnect();
++    }
++    socket_.reset();
++    read_buffer_.reset();
++    write_buffer_.reset();
++    if (completion_callback_) {
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, std::move(completion_callback_));
++    }
++  }
++
++  std::unique_ptr<net::StreamSocket> socket_;
++  const std::string authentication_data_;
++  base::OnceClosure completion_callback_;
++  data_decoder::Gzipper gzipper_;
++  uint64_t request_id_ = 0;
++  std::string request_bytes_;
++  scoped_refptr<net::IOBufferWithSize> read_buffer_;
++  scoped_refptr<net::DrainableIOBuffer> write_buffer_;
++  base::WeakPtrFactory<Connection> weak_factory_{this};
++};
++
++RemoteGzipperWorker::RemoteGzipperWorker(std::string authentication_data)
++    : authentication_data_(std::move(authentication_data)) {}
++
++RemoteGzipperWorker::~RemoteGzipperWorker() {
++  Shutdown();
++}
++
++bool RemoteGzipperWorker::Start(const net::IPEndPoint& listen_endpoint) {
++  if (server_socket_ || authentication_data_.empty()) {
++    return false;
++  }
++
++  auto server =
++      std::make_unique<net::TCPServerSocket>(nullptr, net::NetLogSource());
++  if (server->Listen(listen_endpoint, kListenBacklog, std::nullopt) !=
++      net::OK) {
++    return false;
++  }
++  server_socket_ = std::move(server);
++  AcceptNextConnection();
++  return true;
++}
++
++void RemoteGzipperWorker::Shutdown() {
++  weak_factory_.InvalidateWeakPtrs();
++  connection_.reset();
++  accepted_socket_.reset();
++  server_socket_.reset();
++}
++
++bool RemoteGzipperWorker::GetLocalAddressForTesting(
++    net::IPEndPoint* endpoint) const {
++  return server_socket_ && server_socket_->GetLocalAddress(endpoint) == net::OK;
++}
++
++void RemoteGzipperWorker::AcceptNextConnection() {
++  if (!server_socket_ || connection_) {
++    return;
++  }
++  const int result = server_socket_->Accept(
++      &accepted_socket_, base::BindOnce(&RemoteGzipperWorker::OnAccept,
++                                        weak_factory_.GetWeakPtr()));
++  if (result != net::ERR_IO_PENDING) {
++    OnAccept(result);
++  }
++}
++
++void RemoteGzipperWorker::OnAccept(int result) {
++  if (!server_socket_) {
++    return;
++  }
++  if (result != net::OK) {
++    accepted_socket_.reset();
++    server_socket_.reset();
++    return;
++  }
++
++  connection_ = std::make_unique<Connection>(
++      std::move(accepted_socket_), authentication_data_,
++      base::BindOnce(&RemoteGzipperWorker::OnConnectionComplete,
++                     weak_factory_.GetWeakPtr()));
++  connection_->Start();
++}
++
++void RemoteGzipperWorker::OnConnectionComplete() {
++  connection_.reset();
++  AcceptNextConnection();
++}
++
++}  // namespace content::distributed
+diff --git a/content/distributed/remote_gzipper_worker.h b/content/distributed/remote_gzipper_worker.h
+new file mode 100644
+index 00000000..a88cdf53
+--- /dev/null
++++ b/content/distributed/remote_gzipper_worker.h
+@@ -0,0 +1,52 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_DISTRIBUTED_REMOTE_GZIPPER_WORKER_H_
++#define CONTENT_DISTRIBUTED_REMOTE_GZIPPER_WORKER_H_
++
++#include <memory>
++#include <string>
++
++#include "base/memory/weak_ptr.h"
++#include "net/base/ip_endpoint.h"
++
++namespace net {
++class StreamSocket;
++class TCPServerSocket;
++}  // namespace net
++
++namespace content::distributed {
++
++// Linux server for authenticated protocol-v1 Gzipper::Deflate requests. The
++// listener and accepted connection use Chromium asynchronous networking APIs.
++// It intentionally processes one connection at a time.
++class RemoteGzipperWorker {
++ public:
++  explicit RemoteGzipperWorker(std::string authentication_data);
++  RemoteGzipperWorker(const RemoteGzipperWorker&) = delete;
++  RemoteGzipperWorker& operator=(const RemoteGzipperWorker&) = delete;
++  ~RemoteGzipperWorker();
++
++  bool Start(const net::IPEndPoint& listen_endpoint);
++  void Shutdown();
++
++  bool GetLocalAddressForTesting(net::IPEndPoint* endpoint) const;
++
++ private:
++  class Connection;
++
++  void AcceptNextConnection();
++  void OnAccept(int result);
++  void OnConnectionComplete();
++
++  const std::string authentication_data_;
++  std::unique_ptr<net::TCPServerSocket> server_socket_;
++  std::unique_ptr<net::StreamSocket> accepted_socket_;
++  std::unique_ptr<Connection> connection_;
++  base::WeakPtrFactory<RemoteGzipperWorker> weak_factory_{this};
++};
++
++}  // namespace content::distributed
++
++#endif  // CONTENT_DISTRIBUTED_REMOTE_GZIPPER_WORKER_H_
+diff --git a/content/distributed/remote_gzipper_worker_main.cc b/content/distributed/remote_gzipper_worker_main.cc
+new file mode 100644
+index 00000000..3b809e59
+--- /dev/null
++++ b/content/distributed/remote_gzipper_worker_main.cc
+@@ -0,0 +1,149 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <errno.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <unistd.h>
++
++#include <array>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++#include "base/at_exit.h"
++#include "base/command_line.h"
++#include "base/files/file_descriptor_watcher_posix.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_file.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/run_loop.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/task/single_thread_task_executor.h"
++#include "content/distributed/remote_gzipper_worker.h"
++#include "net/base/ip_address.h"
++#include "net/base/ip_endpoint.h"
++
++namespace {
++
++constexpr char kListenHostSwitch[] = "listen-host";
++constexpr char kListenPortSwitch[] = "listen-port";
++constexpr char kTokenFileSwitch[] = "token-file";
++
++volatile sig_atomic_t g_shutdown_signal_fd = -1;
++
++void HandleShutdownSignal(int signal) {
++  const int saved_errno = errno;
++  const int fd = g_shutdown_signal_fd;
++  if (fd >= 0) {
++    const uint8_t value = static_cast<uint8_t>(signal);
++    const ssize_t result = write(fd, &value, sizeof(value));
++    static_cast<void>(result);
++  }
++  errno = saved_errno;
++}
++
++void OnShutdownSignalReadable(int fd, base::RepeatingClosure quit) {
++  std::array<uint8_t, 16> buffer;
++  while (read(fd, buffer.data(), buffer.size()) > 0) {
++  }
++  quit.Run();
++}
++
++bool InstallSignalHandler(int signal, struct sigaction* previous) {
++  struct sigaction action = {};
++  action.sa_handler = &HandleShutdownSignal;
++  sigemptyset(&action.sa_mask);
++  return sigaction(signal, &action, previous) == 0;
++}
++
++std::string ReadAuthenticationToken(const base::FilePath& path) {
++  std::string token;
++  if (path.empty() || !base::ReadFileToString(path, &token)) {
++    return std::string();
++  }
++  base::TrimWhitespaceASCII(token, base::TRIM_ALL, &token);
++  return token;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++  base::AtExitManager at_exit_manager;
++  base::CommandLine::Init(argc, argv);
++  base::SingleThreadTaskExecutor task_executor(base::MessagePumpType::IO);
++
++  const base::CommandLine& command_line =
++      *base::CommandLine::ForCurrentProcess();
++  const std::string listen_host =
++      command_line.GetSwitchValueASCII(kListenHostSwitch);
++  const std::string port_text =
++      command_line.GetSwitchValueASCII(kListenPortSwitch);
++  const base::FilePath token_file =
++      command_line.GetSwitchValuePath(kTokenFileSwitch);
++
++  unsigned int port = 0;
++  net::IPAddress address;
++  if (!address.AssignFromIPLiteral(listen_host) || address.IsZero() ||
++      !base::StringToUint(port_text, &port) || port == 0 || port > 65535) {
++    LOG(ERROR) << "Specify a non-wildcard IP and valid port with --"
++               << kListenHostSwitch << " and --" << kListenPortSwitch;
++    return 2;
++  }
++
++  std::string token = ReadAuthenticationToken(token_file);
++  if (token.empty()) {
++    LOG(ERROR) << "A readable, non-empty --" << kTokenFileSwitch
++               << " is required";
++    return 2;
++  }
++
++  std::array<int, 2> signal_pipe;
++  if (pipe2(signal_pipe.data(), O_CLOEXEC | O_NONBLOCK) != 0) {
++    LOG(ERROR) << "Unable to create shutdown signal pipe";
++    return 1;
++  }
++  base::ScopedFD signal_read_fd(signal_pipe[0]);
++  base::ScopedFD signal_write_fd(signal_pipe[1]);
++
++  struct sigaction previous_sigterm = {};
++  struct sigaction previous_sigint = {};
++  if (!InstallSignalHandler(SIGTERM, &previous_sigterm) ||
++      !InstallSignalHandler(SIGINT, &previous_sigint)) {
++    sigaction(SIGTERM, &previous_sigterm, nullptr);
++    LOG(ERROR) << "Unable to install shutdown signal handlers";
++    return 1;
++  }
++  g_shutdown_signal_fd = signal_write_fd.get();
++
++  base::RunLoop run_loop;
++  auto signal_watcher = base::FileDescriptorWatcher::WatchReadable(
++      signal_read_fd.get(),
++      base::BindRepeating(&OnShutdownSignalReadable, signal_read_fd.get(),
++                          run_loop.QuitClosure()));
++
++  content::distributed::RemoteGzipperWorker worker(std::move(token));
++  if (!worker.Start(net::IPEndPoint(address, static_cast<uint16_t>(port)))) {
++    signal_watcher.reset();
++    g_shutdown_signal_fd = -1;
++    sigaction(SIGTERM, &previous_sigterm, nullptr);
++    sigaction(SIGINT, &previous_sigint, nullptr);
++    LOG(ERROR) << "Unable to start distributed utility worker";
++    return 1;
++  }
++
++  LOG(INFO) << "Distributed utility worker listening on " << listen_host << ':'
++            << port;
++  run_loop.Run();
++
++  worker.Shutdown();
++  signal_watcher.reset();
++  g_shutdown_signal_fd = -1;
++  sigaction(SIGTERM, &previous_sigterm, nullptr);
++  sigaction(SIGINT, &previous_sigint, nullptr);
++  return 0;
++}
+diff --git a/content/distributed/remote_gzipper_worker_unittest.cc b/content/distributed/remote_gzipper_worker_unittest.cc
+new file mode 100644
+index 00000000..0a108e89
+--- /dev/null
++++ b/content/distributed/remote_gzipper_worker_unittest.cc
+@@ -0,0 +1,204 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/distributed/remote_gzipper_worker.h"
++
++#include <cstring>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/check.h"
++#include "base/memory/ref_counted.h"
++#include "base/test/task_environment.h"
++#include "base/test/test_future.h"
++#include "content/distributed/remote_gzipper_protocol.h"
++#include "mojo/public/cpp/base/big_buffer.h"
++#include "net/base/address_list.h"
++#include "net/base/io_buffer.h"
++#include "net/base/ip_address.h"
++#include "net/base/ip_endpoint.h"
++#include "net/base/net_errors.h"
++#include "net/base/network_handle.h"
++#include "net/base/test_completion_callback.h"
++#include "net/log/net_log_source.h"
++#include "net/socket/tcp_client_socket.h"
++#include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
++#include "services/data_decoder/gzipper.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace content::distributed {
++namespace {
++
++mojo_base::BigBuffer ToBigBuffer(const std::string& input) {
++  mojo_base::BigBuffer buffer(input.size());
++  if (!input.empty()) {
++    std::memcpy(buffer.data(), input.data(), input.size());
++  }
++  return buffer;
++}
++
++std::string ToString(const mojo_base::BigBuffer& input) {
++  if (input.size() == 0) {
++    return std::string();
++  }
++  return std::string(static_cast<const char*>(input.data()), input.size());
++}
++
++void SetUint32(uint32_t value, size_t offset, std::string* output) {
++  for (int shift = 24; shift >= 0; shift -= 8) {
++    (*output)[offset++] = static_cast<char>((value >> shift) & 0xff);
++  }
++}
++
++void SetUint64(uint64_t value, size_t offset, std::string* output) {
++  for (int shift = 56; shift >= 0; shift -= 8) {
++    (*output)[offset++] = static_cast<char>((value >> shift) & 0xff);
++  }
++}
++
++RemoteGzipperRequest MakeRequest(uint64_t request_id = 77) {
++  return RemoteGzipperRequest{
++      request_id, static_cast<uint8_t>(RemoteGzipperOperation::kDeflate),
++      "worker-token", std::string("binary\0input", 12)};
++}
++
++class RemoteGzipperWorkerTest : public testing::Test {
++ protected:
++  RemoteGzipperWorkerTest() : worker_("worker-token") {}
++
++  void SetUp() override {
++    ASSERT_TRUE(worker_.Start(
++        net::IPEndPoint(net::IPAddress::IPv4Localhost(), /*port=*/0)));
++    ASSERT_TRUE(worker_.GetLocalAddressForTesting(&endpoint_));
++  }
++
++  RemoteGzipperResponse Exchange(const std::string& request) {
++    net::TCPClientSocket socket(net::AddressList(endpoint_), nullptr, nullptr,
++                                nullptr, net::NetLogSource(),
++                                net::handles::kInvalidNetworkHandle);
++
++    net::TestCompletionCallback connect_callback;
++    int result = socket.Connect(connect_callback.callback());
++    CHECK_EQ(net::OK, connect_callback.GetResult(result));
++
++    auto source = base::MakeRefCounted<net::StringIOBuffer>(request);
++    auto write_buffer = base::MakeRefCounted<net::DrainableIOBuffer>(
++        source, static_cast<int>(request.size()));
++    while (write_buffer->BytesRemaining() > 0) {
++      net::TestCompletionCallback write_callback;
++      result =
++          socket.Write(write_buffer.get(), write_buffer->BytesRemaining(),
++                       write_callback.callback(), TRAFFIC_ANNOTATION_FOR_TESTS);
++      result = write_callback.GetResult(result);
++      CHECK_GT(result, 0);
++      write_buffer->DidConsume(result);
++    }
++
++    std::string response_bytes;
++    while (true) {
++      auto read_buffer = base::MakeRefCounted<net::IOBufferWithSize>(4096);
++      net::TestCompletionCallback read_callback;
++      result = socket.Read(read_buffer.get(), read_buffer->size(),
++                           read_callback.callback());
++      result = read_callback.GetResult(result);
++      CHECK_GT(result, 0);
++      response_bytes.append(read_buffer->data(), static_cast<size_t>(result));
++      auto response = ParseRemoteGzipperResponse(response_bytes);
++      if (response) {
++        return std::move(*response);
++      }
++    }
++  }
++
++  base::test::TaskEnvironment task_environment_{
++      base::test::TaskEnvironment::MainThreadType::IO};
++  RemoteGzipperWorker worker_;
++  net::IPEndPoint endpoint_;
++};
++
++TEST_F(RemoteGzipperWorkerTest, DeflatesWithChromiumGzipperAndPreservesId) {
++  const auto request = MakeRequest(981);
++  const auto serialized = SerializeRemoteGzipperRequest(request);
++  ASSERT_TRUE(serialized);
++
++  const RemoteGzipperResponse response = Exchange(*serialized);
++  EXPECT_EQ(981u, response.request_id);
++  EXPECT_EQ(RemoteGzipperStatus::kSuccess, response.status);
++  EXPECT_EQ(RemoteGzipperError::kNone, response.error);
++
++  data_decoder::Gzipper gzipper;
++  base::test::TestFuture<std::optional<mojo_base::BigBuffer>> expected;
++  gzipper.Deflate(ToBigBuffer(request.payload), expected.GetCallback());
++  ASSERT_TRUE(expected.Get());
++  EXPECT_EQ(ToString(*expected.Get()), response.payload);
++}
++
++TEST_F(RemoteGzipperWorkerTest, RejectsMissingToken) {
++  const auto request = MakeRequest(82);
++  auto serialized = SerializeRemoteGzipperRequest(request);
++  ASSERT_TRUE(serialized);
++  serialized->erase(kRemoteGzipperRequestHeaderSize,
++                    request.authentication_data.size());
++  SetUint32(0, 16, &*serialized);
++
++  const RemoteGzipperResponse response = Exchange(*serialized);
++  EXPECT_EQ(82u, response.request_id);
++  EXPECT_EQ(RemoteGzipperStatus::kFailure, response.status);
++  EXPECT_EQ(RemoteGzipperError::kMissingAuthentication, response.error);
++  EXPECT_TRUE(response.payload.empty());
++}
++
++TEST_F(RemoteGzipperWorkerTest, RejectsBadToken) {
++  auto request = MakeRequest(83);
++  request.authentication_data = "incorrect-token";
++  const auto serialized = SerializeRemoteGzipperRequest(request);
++  ASSERT_TRUE(serialized);
++
++  const RemoteGzipperResponse response = Exchange(*serialized);
++  EXPECT_EQ(83u, response.request_id);
++  EXPECT_EQ(RemoteGzipperError::kAuthenticationFailed, response.error);
++}
++
++TEST_F(RemoteGzipperWorkerTest, RejectsUnsupportedOperation) {
++  auto request = MakeRequest(84);
++  request.operation_id = 99;
++  const auto serialized = SerializeRemoteGzipperRequest(request);
++  ASSERT_TRUE(serialized);
++
++  const RemoteGzipperResponse response = Exchange(*serialized);
++  EXPECT_EQ(84u, response.request_id);
++  EXPECT_EQ(RemoteGzipperError::kUnsupportedOperation, response.error);
++}
++
++TEST_F(RemoteGzipperWorkerTest, RejectsMalformedFrameWithRequestId) {
++  auto serialized = SerializeRemoteGzipperRequest(MakeRequest(85));
++  ASSERT_TRUE(serialized);
++  (*serialized)[0] = 'X';
++
++  const RemoteGzipperResponse response = Exchange(*serialized);
++  EXPECT_EQ(85u, response.request_id);
++  EXPECT_EQ(RemoteGzipperError::kMalformedFrame, response.error);
++}
++
++TEST_F(RemoteGzipperWorkerTest, RejectsOversizedPayloadBeforeReadingIt) {
++  auto serialized = SerializeRemoteGzipperRequest(MakeRequest(86));
++  ASSERT_TRUE(serialized);
++  serialized->resize(kRemoteGzipperRequestHeaderSize);
++  SetUint64(kRemoteGzipperMaxPayloadSize + 1, 20, &*serialized);
++
++  const RemoteGzipperResponse response = Exchange(*serialized);
++  EXPECT_EQ(86u, response.request_id);
++  EXPECT_EQ(RemoteGzipperError::kOversizedPayload, response.error);
++}
++
++TEST_F(RemoteGzipperWorkerTest, ShutdownIsIdempotent) {
++  worker_.Shutdown();
++  worker_.Shutdown();
++  EXPECT_FALSE(worker_.GetLocalAddressForTesting(&endpoint_));
++}
++
++}  // namespace
++}  // namespace content::distributed
+diff --git a/content/test/BUILD.gn b/content/test/BUILD.gn
+index 540d201d..0d2eac3d 100644
+--- a/content/test/BUILD.gn
++++ b/content/test/BUILD.gn
+@@ -3406,6 +3406,7 @@ test("content_unittests") {
+     "//content/common:for_content_tests",
+     "//content/common/memory_coordinator/mojom",
+     "//content/common/memory_coordinator/mojom:test_interfaces",
++    "//content/distributed:distributed_utility_proxy_tests",
+     "//content/gpu",
+     "//content/public/browser",
+     "//content/public/browser:proto",
+@@ -3518,1 +3519,5 @@ test("content_unittests") {
++  if (is_linux && current_cpu == "x64") {
++    deps += [ "//content/distributed:distributed_utility_worker_tests" ]
++  }
++
+   if (is_chromeos) {
+diff --git a/services/data_decoder/BUILD.gn b/services/data_decoder/BUILD.gn
+index 545a1c59..90094265 100644
+--- a/services/data_decoder/BUILD.gn
++++ b/services/data_decoder/BUILD.gn
+@@ -13,4 +13,5 @@ source_set("lib") {
+     ":*",
+     "public/cpp:*",
+     "//chrome/utility",
++    "//content/distributed:distributed_utility_worker_lib",
+     "//content/utility",
