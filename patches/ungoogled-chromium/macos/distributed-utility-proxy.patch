@@ -3303,6 +3303,29 @@ index 00000000..0a108e89
 +
 +}  // namespace
 +}  // namespace content::distributed
+diff --git a/content/test/BUILD.gn b/content/test/BUILD.gn
+index 540d201d..8b9dc920 100644
+--- a/content/test/BUILD.gn
++++ b/content/test/BUILD.gn
+@@ -3406,6 +3406,7 @@ test("content_unittests") {
+     "//content/common:for_content_tests",
+     "//content/common/memory_coordinator/mojom",
+     "//content/common/memory_coordinator/mojom:test_interfaces",
++    "//content/distributed:distributed_utility_proxy_tests",
+     "//content/gpu",
+     "//content/public/browser",
+     "//content/public/browser:proto",
+@@ -3514,7 +3515,9 @@ test("content_unittests") {
+     "//ui/webui:test_support",
+     "//url",
+   ]
+-
++  if (is_linux && current_cpu == "x64") {
++    deps += [ "//content/distributed:distributed_utility_worker_tests" ]
++  }
+   if (is_chromeos) {
+     sources += [
+       "//content/browser/direct_sockets/firewall_hole_delegate_unittest.cc",
 diff --git a/services/data_decoder/BUILD.gn b/services/data_decoder/BUILD.gn
 index 545a1c59..bb567346 100644
 --- a/services/data_decoder/BUILD.gn
