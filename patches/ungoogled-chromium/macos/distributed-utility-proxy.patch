@@ -76,10 +76,10 @@ index 4d1115c7..2b5326a9 100644
  
 diff --git a/content/distributed/BUILD.gn b/content/distributed/BUILD.gn
 new file mode 100644
-index 00000000..aa207b43
+index 00000000..2b37f3d0
 --- /dev/null
 +++ b/content/distributed/BUILD.gn
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,92 @@
 +# Copyright 2026 The Chromium Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -115,6 +115,7 @@ index 00000000..aa207b43
 +  testonly = true
 +  sources = [
 +    "remote_data_decoder_service_unittest.cc",
++    "remote_data_decoder_service_integration_test.cc",
 +    "remote_gzipper_client_unittest.cc",
 +    "remote_gzipper_protocol_unittest.cc",
 +  ]
@@ -122,8 +123,12 @@ index 00000000..aa207b43
 +    ":distributed_utility_proxy",
 +    "//base",
 +    "//base/test:test_support",
++    "//content/test:test_support",
++    "//mojo/public/cpp/base",
++    "//mojo/public/cpp/bindings",
 +    "//net",
 +    "//net:test_support",
++    "//services/data_decoder:lib",
 +    "//testing/gtest",
 +  ]
 +}
@@ -418,10 +423,10 @@ index 00000000..489cd688
 +#endif  // CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_PROXY_H_
 diff --git a/content/distributed/remote_data_decoder_service.cc b/content/distributed/remote_data_decoder_service.cc
 new file mode 100644
-index 00000000..ef10790d
+index 00000000..aa0897a5
 --- /dev/null
 +++ b/content/distributed/remote_data_decoder_service.cc
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,224 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -467,14 +472,11 @@ index 00000000..ef10790d
 +
 +class RemoteGzipper final : public Gzipper {
 + public:
-+  RemoteGzipper(std::string endpoint, std::string authentication_data)
++  RemoteGzipper(std::string endpoint,
++                std::string authentication_data,
++                mojo::PendingRemote<Gzipper> local_gzipper)
 +      : client_(std::move(endpoint), std::move(authentication_data)) {
-+    ServiceProcessHost::Launch(
-+        local_service_.BindNewPipeAndPassReceiver(),
-+        ServiceProcessHost::Options()
-+            .WithDisplayName("Data Decoder Service (Gzipper fallback)")
-+            .Pass());
-+    local_service_->BindGzipper(local_gzipper_.BindNewPipeAndPassReceiver());
++    local_gzipper_.Bind(std::move(local_gzipper));
 +  }
 +
 +  RemoteGzipper(const RemoteGzipper&) = delete;
@@ -521,7 +523,6 @@ index 00000000..ef10790d
 +    local_gzipper_->Deflate(std::move(data), std::move(callback));
 +  }
 +
-+  mojo::Remote<DataDecoder> local_service_;
 +  mojo::Remote<Gzipper> local_gzipper_;
 +  RemoteGzipperClient client_;
 +  base::WeakPtrFactory<RemoteGzipper> weak_factory_{this};
@@ -529,14 +530,20 @@ index 00000000..ef10790d
 +
 +class RemoteDataDecoder final : public DataDecoder {
 + public:
-+  RemoteDataDecoder(std::string endpoint, std::string authentication_data)
++  RemoteDataDecoder(std::string endpoint,
++                    std::string authentication_data,
++                    mojo::PendingRemote<DataDecoder> local_service)
 +      : endpoint_(std::move(endpoint)),
 +        authentication_data_(std::move(authentication_data)) {
-+    ServiceProcessHost::Launch(
-+        local_service_.BindNewPipeAndPassReceiver(),
-+        ServiceProcessHost::Options()
-+            .WithDisplayName("Data Decoder Service (local fallback)")
-+            .Pass());
++    if (local_service.is_valid()) {
++      local_service_.Bind(std::move(local_service));
++    } else {
++      ServiceProcessHost::Launch(
++          local_service_.BindNewPipeAndPassReceiver(),
++          ServiceProcessHost::Options()
++              .WithDisplayName("Data Decoder Service (local fallback)")
++              .Pass());
++    }
 +  }
 +
 +  RemoteDataDecoder(const RemoteDataDecoder&) = delete;
@@ -561,8 +568,11 @@ index 00000000..ef10790d
 +  }
 +
 +  void BindGzipper(mojo::PendingReceiver<Gzipper> receiver) override {
++    mojo::PendingRemote<Gzipper> local_gzipper;
++    local_service_->BindGzipper(local_gzipper.InitWithNewPipeAndPassReceiver());
 +    mojo::MakeSelfOwnedReceiver(
-+        std::make_unique<RemoteGzipper>(endpoint_, authentication_data_),
++        std::make_unique<RemoteGzipper>(endpoint_, authentication_data_,
++                                        std::move(local_gzipper)),
 +        std::move(receiver));
 +  }
 +
@@ -603,23 +613,50 @@ index 00000000..ef10790d
 +  local_deflate.Run(std::move(original_data), std::move(callback));
 +}
 +
++namespace {
++
++void BindRemoteDataDecoderServiceImpl(
++    mojo::PendingReceiver<data_decoder::mojom::DataDecoderService> receiver,
++    std::string worker_endpoint,
++    std::string authentication_data,
++    mojo::PendingRemote<data_decoder::mojom::DataDecoderService>
++        local_service) {
++  mojo::MakeSelfOwnedReceiver(
++      std::make_unique<RemoteDataDecoder>(std::move(worker_endpoint),
++                                          std::move(authentication_data),
++                                          std::move(local_service)),
++      std::move(receiver));
++}
++
++}  // namespace
++
 +void BindRemoteDataDecoderService(
 +    mojo::PendingReceiver<data_decoder::mojom::DataDecoderService> receiver,
 +    std::string worker_endpoint,
 +    std::string authentication_data) {
-+  mojo::MakeSelfOwnedReceiver(
-+      std::make_unique<RemoteDataDecoder>(std::move(worker_endpoint),
-+                                          std::move(authentication_data)),
-+      std::move(receiver));
++  BindRemoteDataDecoderServiceImpl(std::move(receiver),
++                                   std::move(worker_endpoint),
++                                   std::move(authentication_data), {});
++}
++
++void BindRemoteDataDecoderServiceForTesting(
++    mojo::PendingReceiver<data_decoder::mojom::DataDecoderService> receiver,
++    std::string worker_endpoint,
++    std::string authentication_data,
++    mojo::PendingRemote<data_decoder::mojom::DataDecoderService>
++        local_service) {
++  BindRemoteDataDecoderServiceImpl(
++      std::move(receiver), std::move(worker_endpoint),
++      std::move(authentication_data), std::move(local_service));
 +}
 +
 +}  // namespace content::distributed
 diff --git a/content/distributed/remote_data_decoder_service.h b/content/distributed/remote_data_decoder_service.h
 new file mode 100644
-index 00000000..c7d8937e
+index 00000000..fa1174c3
 --- /dev/null
 +++ b/content/distributed/remote_data_decoder_service.h
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,43 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -627,9 +664,14 @@ index 00000000..c7d8937e
 +#ifndef CONTENT_DISTRIBUTED_REMOTE_DATA_DECODER_SERVICE_H_
 +#define CONTENT_DISTRIBUTED_REMOTE_DATA_DECODER_SERVICE_H_
 +
++#include <string>
++
 +#include "base/functional/callback.h"
 +#include "content/distributed/remote_gzipper_client.h"
 +#include "mojo/public/cpp/base/big_buffer.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/pending_remote.h"
++#include "services/data_decoder/public/mojom/data_decoder_service.mojom.h"
 +#include "services/data_decoder/public/mojom/gzipper.mojom.h"
 +
 +namespace content::distributed {
@@ -646,9 +688,497 @@ index 00000000..c7d8937e
 +    data_decoder::mojom::Gzipper::DeflateCallback callback,
 +    LocalGzipperDeflateCallback local_deflate);
 +
++// Test-only entry point that supplies the local service directly. Production
++// callers use BindRemoteDataDecoderService() and launch the normal local
++// service path.
++void BindRemoteDataDecoderServiceForTesting(
++    mojo::PendingReceiver<data_decoder::mojom::DataDecoderService> receiver,
++    std::string worker_endpoint,
++    std::string authentication_data,
++    mojo::PendingRemote<data_decoder::mojom::DataDecoderService> local_service);
++
 +}  // namespace content::distributed
 +
 +#endif  // CONTENT_DISTRIBUTED_REMOTE_DATA_DECODER_SERVICE_H_
+diff --git a/content/distributed/remote_data_decoder_service_integration_test.cc b/content/distributed/remote_data_decoder_service_integration_test.cc
+new file mode 100644
+index 00000000..295b5f70
+--- /dev/null
++++ b/content/distributed/remote_data_decoder_service_integration_test.cc
+@@ -0,0 +1,473 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <cstring>
++#include <memory>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/check.h"
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/weak_ptr.h"
++#include "base/run_loop.h"
++#include "base/test/scoped_command_line.h"
++#include "base/test/test_future.h"
++#include "base/time/time.h"
++#include "content/distributed/distributed_utility_proxy.h"
++#include "content/distributed/remote_data_decoder_service.h"
++#include "content/distributed/remote_gzipper_protocol.h"
++#include "content/public/test/browser_task_environment.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++#include "net/base/io_buffer.h"
++#include "net/base/ip_address.h"
++#include "net/base/ip_endpoint.h"
++#include "net/base/net_errors.h"
++#include "net/log/net_log_source.h"
++#include "net/socket/stream_socket.h"
++#include "net/socket/tcp_server_socket.h"
++#include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
++#include "services/data_decoder/gzipper.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace content::distributed {
++namespace {
++
++using DataDecoder = data_decoder::mojom::DataDecoderService;
++using Gzipper = data_decoder::mojom::Gzipper;
++using Buffer = mojo_base::BigBuffer;
++
++Buffer ToBuffer(std::string_view input) {
++  Buffer buffer(input.size());
++  if (!input.empty()) {
++    std::memcpy(buffer.data(), input.data(), input.size());
++  }
++  return buffer;
++}
++
++std::string ToString(const Buffer& input) {
++  if (input.size() == 0) {
++    return std::string();
++  }
++  return std::string(static_cast<const char*>(input.data()), input.size());
++}
++
++std::string DeflateLocally(std::string_view input) {
++  data_decoder::Gzipper gzipper;
++  base::test::TestFuture<std::optional<Buffer>> future;
++  gzipper.Deflate(ToBuffer(input), future.GetCallback());
++  const std::optional<Buffer>& result = future.Get();
++  CHECK(result);
++  return ToString(*result);
++}
++
++std::string UnavailableLoopbackEndpoint() {
++  net::TCPServerSocket server(nullptr, net::NetLogSource());
++  CHECK_EQ(net::OK,
++           server.Listen(net::IPEndPoint(net::IPAddress::IPv4Localhost(), 0), 1,
++                         std::nullopt));
++  net::IPEndPoint endpoint;
++  CHECK_EQ(net::OK, server.GetLocalAddress(&endpoint));
++  return endpoint.ToString();
++}
++
++class LocalGzipper final : public Gzipper {
++ public:
++  LocalGzipper() = default;
++  ~LocalGzipper() override = default;
++
++  void Deflate(Buffer data, DeflateCallback callback) override {
++    gzipper_.Deflate(std::move(data), std::move(callback));
++  }
++
++  void Inflate(Buffer data, uint64_t limit, InflateCallback callback) override {
++    gzipper_.Inflate(std::move(data), limit, std::move(callback));
++  }
++
++  void Compress(Buffer data, CompressCallback callback) override {
++    gzipper_.Compress(std::move(data), std::move(callback));
++  }
++
++  void Uncompress(Buffer data, UncompressCallback callback) override {
++    gzipper_.Uncompress(std::move(data), std::move(callback));
++  }
++
++ private:
++  data_decoder::Gzipper gzipper_;
++};
++
++class LocalDataDecoder final : public DataDecoder {
++ public:
++  explicit LocalDataDecoder(mojo::PendingReceiver<DataDecoder> receiver)
++      : receiver_(this, std::move(receiver)) {}
++  ~LocalDataDecoder() override = default;
++
++  void BindImageDecoder(mojo::PendingReceiver<data_decoder::mojom::ImageDecoder>
++                            receiver) override {
++    receiver.reset();
++  }
++
++  void BindXmlParser(
++      mojo::PendingReceiver<data_decoder::mojom::XmlParser> receiver) override {
++    receiver.reset();
++  }
++
++  void BindWebBundleParserFactory(
++      mojo::PendingReceiver<web_package::mojom::WebBundleParserFactory>
++          receiver) override {
++    receiver.reset();
++  }
++
++  void BindGzipper(mojo::PendingReceiver<Gzipper> receiver) override {
++    mojo::MakeSelfOwnedReceiver(std::make_unique<LocalGzipper>(),
++                                std::move(receiver));
++  }
++
++  void BindStructuredHeadersParser(
++      mojo::PendingReceiver<data_decoder::mojom::StructuredHeadersParser>
++          receiver) override {
++    receiver.reset();
++  }
++
++  void BindCborParser(mojo::PendingReceiver<data_decoder::mojom::CborParser>
++                          receiver) override {
++    receiver.reset();
++  }
++
++  void BindPixCodeValidator(
++      mojo::PendingReceiver<payments::facilitated::mojom::PixCodeValidator>
++          receiver) override {
++    receiver.reset();
++  }
++
++ private:
++  mojo::Receiver<DataDecoder> receiver_;
++};
++
++enum class WorkerBehavior {
++  kSuccess,
++  kAuthenticationFailure,
++  kHang,
++  kMalformedResponse,
++};
++
++// A deliberately small loopback server. It exercises the production wire
++// protocol without relying on a utility process, Tailscale, or real data.
++class LoopbackWorker {
++ public:
++  explicit LoopbackWorker(WorkerBehavior behavior)
++      : behavior_(behavior), server_(nullptr, net::NetLogSource()) {
++    CHECK_EQ(net::OK,
++             server_.Listen(net::IPEndPoint(net::IPAddress::IPv4Localhost(), 0),
++                            1, std::nullopt));
++    CHECK_EQ(net::OK, server_.GetLocalAddress(&endpoint_));
++    StartAccept();
++  }
++
++  LoopbackWorker(const LoopbackWorker&) = delete;
++  LoopbackWorker& operator=(const LoopbackWorker&) = delete;
++  ~LoopbackWorker() = default;
++
++  std::string endpoint() const { return endpoint_.ToString(); }
++  size_t request_count() const { return requests_.size(); }
++  const RemoteGzipperRequest& request(size_t index) const {
++    return requests_.at(index);
++  }
++
++  void WaitForRequests(size_t count) {
++    if (request_count() >= count) {
++      return;
++    }
++    base::RunLoop run_loop;
++    waiting_for_request_count_ = count;
++    request_received_ = run_loop.QuitClosure();
++    run_loop.Run();
++  }
++
++ private:
++  void StartAccept() {
++    socket_.reset();
++    request_bytes_.clear();
++    const int result = server_.Accept(
++        &socket_,
++        base::BindOnce(&LoopbackWorker::OnAccept, weak_factory_.GetWeakPtr()));
++    CHECK_EQ(net::ERR_IO_PENDING, result);
++  }
++
++  void OnAccept(int result) {
++    if (result == net::OK) {
++      ReadRequest();
++    }
++  }
++
++  void ReadRequest() {
++    read_buffer_ = base::MakeRefCounted<net::IOBufferWithSize>(4096);
++    const int result = socket_->Read(
++        read_buffer_.get(), read_buffer_->size(),
++        base::BindOnce(&LoopbackWorker::OnRead, weak_factory_.GetWeakPtr()));
++    if (result != net::ERR_IO_PENDING) {
++      OnRead(result);
++    }
++  }
++
++  void OnRead(int result) {
++    if (result <= 0) {
++      return;
++    }
++    request_bytes_.append(read_buffer_->data(), static_cast<size_t>(result));
++    read_buffer_.reset();
++    std::optional<RemoteGzipperRequest> parsed =
++        ParseRemoteGzipperRequest(request_bytes_);
++    if (!parsed) {
++      ReadRequest();
++      return;
++    }
++    requests_.push_back(std::move(*parsed));
++    if (request_received_ && request_count() >= waiting_for_request_count_) {
++      std::move(request_received_).Run();
++    }
++    if (behavior_ == WorkerBehavior::kHang) {
++      return;
++    }
++    if (behavior_ == WorkerBehavior::kMalformedResponse) {
++      WriteResponse("malformed-loopback-response");
++      return;
++    }
++    if (behavior_ == WorkerBehavior::kAuthenticationFailure) {
++      const auto response = MakeRemoteGzipperFailureResponse(
++          requests_.back().request_id,
++          RemoteGzipperError::kAuthenticationFailed);
++      const auto serialized = SerializeRemoteGzipperResponse(response);
++      CHECK(serialized);
++      WriteResponse(*serialized);
++      return;
++    }
++    gzipper_.Deflate(
++        ToBuffer(requests_.back().payload),
++        base::BindOnce(&LoopbackWorker::OnDeflated, weak_factory_.GetWeakPtr(),
++                       requests_.back().request_id));
++  }
++
++  void OnDeflated(uint64_t request_id, std::optional<Buffer> output) {
++    CHECK(output);
++    const RemoteGzipperResponse response{
++        request_id, RemoteGzipperStatus::kSuccess, RemoteGzipperError::kNone,
++        ToString(*output)};
++    const auto serialized = SerializeRemoteGzipperResponse(response);
++    CHECK(serialized);
++    WriteResponse(*serialized);
++  }
++
++  void WriteResponse(std::string response) {
++    auto source =
++        base::MakeRefCounted<net::StringIOBuffer>(std::move(response));
++    write_buffer_ =
++        base::MakeRefCounted<net::DrainableIOBuffer>(source, source->size());
++    WriteMore();
++  }
++
++  void WriteMore() {
++    const int result = socket_->Write(
++        write_buffer_.get(), write_buffer_->BytesRemaining(),
++        base::BindOnce(&LoopbackWorker::OnWrite, weak_factory_.GetWeakPtr()),
++        TRAFFIC_ANNOTATION_FOR_TESTS);
++    if (result != net::ERR_IO_PENDING) {
++      OnWrite(result);
++    }
++  }
++
++  void OnWrite(int result) {
++    if (result <= 0) {
++      return;
++    }
++    write_buffer_->DidConsume(result);
++    if (write_buffer_->BytesRemaining() > 0) {
++      WriteMore();
++      return;
++    }
++    write_buffer_.reset();
++    StartAccept();
++  }
++
++  const WorkerBehavior behavior_;
++  net::TCPServerSocket server_;
++  net::IPEndPoint endpoint_;
++  std::unique_ptr<net::StreamSocket> socket_;
++  scoped_refptr<net::IOBufferWithSize> read_buffer_;
++  scoped_refptr<net::DrainableIOBuffer> write_buffer_;
++  std::string request_bytes_;
++  std::vector<RemoteGzipperRequest> requests_;
++  size_t waiting_for_request_count_ = 0;
++  base::OnceClosure request_received_;
++  data_decoder::Gzipper gzipper_;
++  base::WeakPtrFactory<LoopbackWorker> weak_factory_{this};
++};
++
++class ScopedLogCapture {
++ public:
++  ScopedLogCapture() {
++    CHECK(!instance_);
++    instance_ = this;
++    previous_handler_ = logging::GetLogMessageHandler();
++    logging::SetLogMessageHandler(&ScopedLogCapture::Capture);
++  }
++
++  ScopedLogCapture(const ScopedLogCapture&) = delete;
++  ScopedLogCapture& operator=(const ScopedLogCapture&) = delete;
++
++  ~ScopedLogCapture() {
++    logging::SetLogMessageHandler(previous_handler_);
++    instance_ = nullptr;
++  }
++
++  bool Contains(std::string_view value) const {
++    return messages_.find(value) != std::string::npos;
++  }
++
++ private:
++  static bool Capture(int severity,
++                      const char* file,
++                      int line,
++                      size_t message_start,
++                      const std::string& message) {
++    instance_->messages_.append(message);
++    return instance_->previous_handler_
++               ? instance_->previous_handler_(severity, file, line,
++                                              message_start, message)
++               : false;
++  }
++
++  static ScopedLogCapture* instance_;
++  logging::LogMessageHandlerFunction previous_handler_ = nullptr;
++  std::string messages_;
++};
++
++ScopedLogCapture* ScopedLogCapture::instance_ = nullptr;
++
++class RemoteDataDecoderServiceIntegrationTest : public testing::Test {
++ public:
++  RemoteDataDecoderServiceIntegrationTest() = default;
++  ~RemoteDataDecoderServiceIntegrationTest() override = default;
++
++ protected:
++  void BindRemote(std::string endpoint, std::string token) {
++    mojo::Remote<DataDecoder> local_service;
++    local_service_ = std::make_unique<LocalDataDecoder>(
++        local_service.BindNewPipeAndPassReceiver());
++    BindRemoteDataDecoderServiceForTesting(
++        remote_service_.BindNewPipeAndPassReceiver(), std::move(endpoint),
++        std::move(token), local_service.Unbind());
++    remote_service_->BindGzipper(remote_gzipper_.BindNewPipeAndPassReceiver());
++  }
++
++  std::string Deflate(std::string_view input) {
++    base::test::TestFuture<std::optional<Buffer>> future;
++    remote_gzipper_->Deflate(ToBuffer(input), future.GetCallback());
++    const std::optional<Buffer>& result = future.Get();
++    CHECK(result);
++    return ToString(*result);
++  }
++
++  BrowserTaskEnvironment task_environment_{
++      BrowserTaskEnvironment::IO_MAINLOOP,
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  std::unique_ptr<LocalDataDecoder> local_service_;
++  mojo::Remote<DataDecoder> remote_service_;
++  mojo::Remote<Gzipper> remote_gzipper_;
++};
++
++TEST_F(RemoteDataDecoderServiceIntegrationTest,
++       RemoteModeDisabledKeepsBrowserRouteLocal) {
++  base::test::ScopedCommandLine command_line;
++  command_line.GetProcessCommandLine()->RemoveSwitch(
++      "enable-distributed-utility-proxy");
++  command_line.GetProcessCommandLine()->RemoveSwitch(
++      "distributed-utility-worker");
++  command_line.GetProcessCommandLine()->RemoveSwitch(
++      "distributed-utility-token-file");
++
++  EXPECT_FALSE(ShouldRouteDataDecoderRemotely());
++}
++
++TEST_F(RemoteDataDecoderServiceIntegrationTest,
++       RemoteSuccessMatchesLocalDeflateOutput) {
++  LoopbackWorker worker(WorkerBehavior::kSuccess);
++  const std::string input = "browser-loopback-deflate";
++  BindRemote(worker.endpoint(), "loopback-token");
++
++  EXPECT_EQ(DeflateLocally(input), Deflate(input));
++  worker.WaitForRequests(1);
++  EXPECT_EQ("loopback-token", worker.request(0).authentication_data);
++  EXPECT_EQ(input, worker.request(0).payload);
++}
++
++TEST_F(RemoteDataDecoderServiceIntegrationTest, UnavailableWorkerFallsBack) {
++  BindRemote(UnavailableLoopbackEndpoint(), "loopback-token");
++  EXPECT_EQ(DeflateLocally("unavailable-worker"),
++            Deflate("unavailable-worker"));
++}
++
++TEST_F(RemoteDataDecoderServiceIntegrationTest,
++       AuthenticationFailureFallsBack) {
++  LoopbackWorker worker(WorkerBehavior::kAuthenticationFailure);
++  BindRemote(worker.endpoint(), "loopback-token");
++
++  EXPECT_EQ(DeflateLocally("auth-fallback"), Deflate("auth-fallback"));
++  worker.WaitForRequests(1);
++}
++
++TEST_F(RemoteDataDecoderServiceIntegrationTest, TimeoutFallsBack) {
++  LoopbackWorker worker(WorkerBehavior::kHang);
++  BindRemote(worker.endpoint(), "loopback-token");
++  base::test::TestFuture<std::optional<Buffer>> future;
++  remote_gzipper_->Deflate(ToBuffer("timeout-fallback"), future.GetCallback());
++  worker.WaitForRequests(1);
++  task_environment_.FastForwardBy(base::Seconds(10));
++
++  const std::optional<Buffer>& result = future.Get();
++  ASSERT_TRUE(result);
++  EXPECT_EQ(DeflateLocally("timeout-fallback"), ToString(*result));
++}
++
++TEST_F(RemoteDataDecoderServiceIntegrationTest,
++       MalformedResponseFallsBackWithoutCrashing) {
++  LoopbackWorker worker(WorkerBehavior::kMalformedResponse);
++  BindRemote(worker.endpoint(), "loopback-token");
++
++  EXPECT_EQ(DeflateLocally("malformed-fallback"),
++            Deflate("malformed-fallback"));
++  worker.WaitForRequests(1);
++}
++
++TEST_F(RemoteDataDecoderServiceIntegrationTest, SequentialRequestsWork) {
++  LoopbackWorker worker(WorkerBehavior::kSuccess);
++  BindRemote(worker.endpoint(), "loopback-token");
++
++  EXPECT_EQ(DeflateLocally("first-request"), Deflate("first-request"));
++  EXPECT_EQ(DeflateLocally("second-request"), Deflate("second-request"));
++  worker.WaitForRequests(2);
++  EXPECT_EQ("first-request", worker.request(0).payload);
++  EXPECT_EQ("second-request", worker.request(1).payload);
++}
++
++TEST_F(RemoteDataDecoderServiceIntegrationTest, PayloadsAreNotLogged) {
++  LoopbackWorker worker(WorkerBehavior::kSuccess);
++  constexpr char kPayload[] = "loopback-payload-log-sentinel-7A3F";
++  BindRemote(worker.endpoint(), "loopback-token");
++  ScopedLogCapture log_capture;
++
++  EXPECT_EQ(DeflateLocally(kPayload), Deflate(kPayload));
++  worker.WaitForRequests(1);
++  EXPECT_FALSE(log_capture.Contains(kPayload));
++}
++
++}  // namespace
++}  // namespace content::distributed
 diff --git a/content/distributed/remote_data_decoder_service_unittest.cc b/content/distributed/remote_data_decoder_service_unittest.cc
 new file mode 100644
 index 00000000..6413d1a4
@@ -2773,31 +3303,14 @@ index 00000000..0a108e89
 +
 +}  // namespace
 +}  // namespace content::distributed
-diff --git a/content/test/BUILD.gn b/content/test/BUILD.gn
-index 540d201d..0d2eac3d 100644
---- a/content/test/BUILD.gn
-+++ b/content/test/BUILD.gn
-@@ -3406,6 +3406,7 @@ test("content_unittests") {
-     "//content/common:for_content_tests",
-     "//content/common/memory_coordinator/mojom",
-     "//content/common/memory_coordinator/mojom:test_interfaces",
-+    "//content/distributed:distributed_utility_proxy_tests",
-     "//content/gpu",
-     "//content/public/browser",
-     "//content/public/browser:proto",
-@@ -3518,1 +3519,5 @@ test("content_unittests") {
-+  if (is_linux && current_cpu == "x64") {
-+    deps += [ "//content/distributed:distributed_utility_worker_tests" ]
-+  }
-+
-   if (is_chromeos) {
 diff --git a/services/data_decoder/BUILD.gn b/services/data_decoder/BUILD.gn
-index 545a1c59..90094265 100644
+index 545a1c59..bb567346 100644
 --- a/services/data_decoder/BUILD.gn
 +++ b/services/data_decoder/BUILD.gn
-@@ -13,4 +13,5 @@ source_set("lib") {
+@@ -13,4 +13,6 @@ source_set("lib") {
      ":*",
      "public/cpp:*",
      "//chrome/utility",
 +    "//content/distributed:distributed_utility_worker_lib",
++    "//content/distributed:distributed_utility_proxy_tests",
      "//content/utility",
