@@ -18,6 +18,23 @@
    "+content/public/app",
    "+content/public/browser",
    "+device/base/synchronization",
+--- a/content/browser/browser_main_loop.cc
++++ b/content/browser/browser_main_loop.cc
+@@ -4,1 +4,2 @@
+ #include "content/browser/browser_main_loop.h"
++#include "content/distributed/distributed_utility_proxy.h"
+@@ -892,6 +893,11 @@ class OopDataDecoder : public data_decoder::ServiceProvider {
+   void BindDataDecoderService(
+       mojo::PendingReceiver<data_decoder::mojom::DataDecoderService> receiver)
+       override {
++    if (distributed::ShouldRouteDataDecoderRemotely()) {
++      distributed::LogRemoteDataDecoderFallback(
++          distributed::GetDistributedWorkerEndpoint());
++    }
++
+     ServiceProcessHost::Launch(
+         std::move(receiver),
+         ServiceProcessHost::Options().WithDisplayName("Data Decoder Service").Pass());
 --- a/content/browser/service_host/utility_process_host.cc
 +++ b/content/browser/service_host/utility_process_host.cc
 @@ -30,6 +30,7 @@
@@ -56,13 +73,14 @@
 +}
 --- /dev/null
 +++ b/content/distributed/distributed_utility_proxy.cc
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,53 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "content/distributed/distributed_utility_proxy.h"
 +
++#include "base/command_line.h"
 +#include "base/logging.h"
 +
 +namespace content::distributed {
@@ -71,11 +89,36 @@
 +
 +constexpr char kDataDecoderServiceName[] =
 +    "data_decoder.mojom.DataDecoderService";
++constexpr char kEnableDistributedDataDecoder[] =
++    "distributed-data-decoder";
++constexpr char kDistributedWorker[] = "distributed-worker";
 +
 +}  // namespace
 +
 +bool IsRemoteEligibleUtilityService(const std::string& service_name) {
 +  return service_name == kDataDecoderServiceName;
++}
++
++bool IsDistributedDataDecoderEnabled() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      kEnableDistributedDataDecoder);
++}
++
++std::string GetDistributedWorkerEndpoint() {
++  return base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++      kDistributedWorker);
++}
++
++bool ShouldRouteDataDecoderRemotely() {
++  return IsDistributedDataDecoderEnabled() &&
++         !GetDistributedWorkerEndpoint().empty();
++}
++
++void LogRemoteDataDecoderFallback(const std::string& worker_endpoint) {
++  LOG(WARNING) << "DISTRIBUTED: remote Data Decoder requested for "
++               << worker_endpoint
++               << "; proxy transport is not implemented yet; using local "
++                  "Data Decoder service";
 +}
 +
 +void LogRemoteEligibleUtilityService(const std::string& service_name) {
@@ -86,7 +129,7 @@
 +}  // namespace content::distributed
 --- /dev/null
 +++ b/content/distributed/distributed_utility_proxy.h
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,32 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -100,8 +143,99 @@
 +
 +bool IsRemoteEligibleUtilityService(const std::string& service_name);
 +
++// Returns true when the distributed Data Decoder path was explicitly enabled.
++bool IsDistributedDataDecoderEnabled();
++
++// Returns the configured worker endpoint, for example "100.64.0.2:8765".
++// An empty result means no worker endpoint was configured.
++std::string GetDistributedWorkerEndpoint();
++
++// Returns true only when remote routing is enabled and an endpoint is set.
++bool ShouldRouteDataDecoderRemotely();
++
++// Records that the configured remote route is deliberately falling back to
++// Chromium's local service until the proxy transport is available.
++void LogRemoteDataDecoderFallback(const std::string& worker_endpoint);
++
 +void LogRemoteEligibleUtilityService(const std::string& service_name);
 +
 +}  // namespace content::distributed
 +
 +#endif  // CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_PROXY_H_
+--- /dev/null
++++ b/content/distributed/REMOTE_GZIPPER_PROTOCOL.md
+@@ -0,0 +1,74 @@
++# Remote Gzipper protocol, version 1
++
++This protocol carries only `data_decoder.mojom.Gzipper` operations between the
++macOS Chromium browser process and a Debian worker reachable through Tailscale.
++It does not carry Mojo messages or Mojo handles.
++
++The connection is a single ordered byte stream. The browser opens a connection
++per Gzipper request. The worker processes one request, returns one response,
++and closes the connection. This deliberately avoids connection reuse, request
++multiplexing, and cancellation semantics in version 1.
++
++## Transport requirements
++
++- The worker must listen only on a Tailscale address or another explicitly
++  private interface. Do not bind this protocol to a public interface.
++- The browser must reject endpoints without an explicit host and port.
++- Version 1 has no application-layer authentication or encryption. Tailscale
++  provides the encrypted, authenticated network path. A later protocol version
++  may add application authentication without changing version 1 framing.
++- The browser applies a 10-second end-to-end timeout. Timeout, connection, or
++  protocol errors cause a local Data Decoder fallback; they are not returned as
++  successful empty output.
++
++## Frame
++
++All integer fields are unsigned and big-endian. A frame is:
++
++| Field | Bytes | Value |
++| --- | ---: | --- |
++| magic | 4 | ASCII `UCD1` |
++| version | 2 | `1` |
++| message type | 1 | See below |
++| operation | 1 | See below |
++| request ID | 8 | Browser-generated nonzero value |
++| payload length | 8 | Number of payload bytes following the header |
++| payload | variable | Operation input, output, or error text |
++
++The fixed header is 24 bytes. A receiver must read exactly one complete frame;
++extra bytes, a bad magic value, an unknown version, or an invalid field causes
++the request to fail.
++
++The maximum payload length is 64 MiB. The browser rejects larger input before
++connecting. The worker rejects oversized input and output. This bound applies
++to the encoded payload only, not to an eventual local fallback result.
++
++## Request operations
++
++Requests use message type `1`.
++
++| Operation | Value | Maps to |
++| --- | ---: | --- |
++| deflate | 1 | `Gzipper::Deflate(data)` |
++| inflate | 2 | `Gzipper::Inflate(data, max_uncompressed_size)` |
++| compress | 3 | `Gzipper::Compress(data)` |
++| uncompress | 4 | `Gzipper::Uncompress(compressed_data)` |
++
++For operations 1, 3, and 4, the payload is the source bytes. For operation 2,
++the payload is an 8-byte big-endian `max_uncompressed_size` followed by the
++source bytes. `max_uncompressed_size` may be zero only if Chromium permits it;
++the worker must pass it through unchanged to its decompressor limit.
++
++## Responses
++
++A success response uses message type `2`, the original operation, request ID,
++and output bytes as the payload.
++
++A failure response uses message type `3`, the original operation and request
++ID, and a UTF-8 diagnostic payload of at most 1 KiB. The worker must send a
++failure response for malformed input, unsupported operations, size-limit
++violations, and compression failures. It must not send partial output.
++
++The browser treats a failure response as a remote failure and invokes the local
++Gzipper implementation for that request. It must validate that response type,
++operation, and request ID match the pending request before accepting output.
