@@ -380,7 +380,7 @@ new file mode 100644
 index 00000000..489cd688
 --- /dev/null
 +++ b/content/distributed/distributed_utility_proxy.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,49 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -435,7 +435,7 @@ new file mode 100644
 index 00000000..aa0897a5
 --- /dev/null
 +++ b/content/distributed/remote_data_decoder_service.cc
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,220 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -476,7 +476,7 @@ index 00000000..aa0897a5
 +  if (data.size() == 0) {
 +    return std::string();
 +  }
-+  return std::string(static_cast<const char*>(data.data()), data.size());
++  return std::string(reinterpret_cast<const char*>(data.data()), data.size());
 +}
 +
 +class RemoteGzipper final : public Gzipper {
