@@ -26,11 +26,12 @@ diff --git a/content/browser/browser_main_loop.cc b/content/browser/browser_main
 index e605be3d..299e1261 100644
 --- a/content/browser/browser_main_loop.cc
 +++ b/content/browser/browser_main_loop.cc
-@@ -107,6 +107,7 @@
+@@ -107,6 +107,8 @@
  #include "content/common/pseudonymization_salt.h"
  #include "content/common/skia_utils.h"
  #include "content/common/thread_pool_util.h"
 +#include "content/distributed/distributed_utility_proxy.h"
++#include "content/distributed/distributed_utility_smoke_test.h"
  #include "content/public/browser/audio_service.h"
  #include "content/public/browser/background_tracing.h"
  #include "content/public/browser/browser_main_parts.h"
@@ -58,6 +59,13 @@ index e605be3d..299e1261 100644
      ServiceProcessHost::Launch(
          std::move(receiver),
          ServiceProcessHost::Options()
+@@ -1337,3 +1355,5 @@ void BrowserMainLoop::PostCreateThreadsImpl() {
+   data_decoder_service_provider_ = std::make_unique<OopDataDecoder>();
+-
++
++  distributed::MaybeRunDistributedUtilitySmokeTest();
++
+   HistogramSynchronizer::GetInstance();
 diff --git a/content/browser/service_host/utility_process_host.cc b/content/browser/service_host/utility_process_host.cc
 index 4d1115c7..2b5326a9 100644
 --- a/content/browser/service_host/utility_process_host.cc
@@ -86,7 +94,7 @@ new file mode 100644
 index 00000000..2b37f3d0
 --- /dev/null
 +++ b/content/distributed/BUILD.gn
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,94 @@
 +# Copyright 2026 The Chromium Authors
 +# Use of this source code is governed by a BSD-style license that can be
 +# found in the LICENSE file.
@@ -95,6 +103,8 @@ index 00000000..2b37f3d0
 +  sources = [
 +    "distributed_utility_proxy.cc",
 +    "distributed_utility_proxy.h",
++    "distributed_utility_smoke_test.cc",
++    "distributed_utility_smoke_test.h",
 +    "remote_data_decoder_service.cc",
 +    "remote_data_decoder_service.h",
 +    "remote_gzipper_client.cc",
@@ -106,6 +116,7 @@ index 00000000..2b37f3d0
 +    "//base",
 +    "//mojo/public/cpp/bindings",
 +    "//net",
++    "//services/data_decoder/public/cpp",
 +    "//services/data_decoder/public/mojom",
 +  ]
 +}
@@ -183,7 +194,7 @@ new file mode 100644
 index 00000000..f9a2e4c7
 --- /dev/null
 +++ b/content/distributed/REMOTE_GZIPPER_PROTOCOL.md
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,123 @@
 +# Remote Gzipper protocol, version 1
 +
 +Version 1 carries only `data_decoder.mojom.Gzipper::Deflate` between the macOS
@@ -291,6 +302,22 @@ index 00000000..f9a2e4c7
 +The repository's `distributed-worker/` Python implementation is a
 +non-production development harness for protocol experiments. It is not the
 +worker deployed with Chromium.
++
++## Browser-side synthetic smoke test
++
++Ordinary browsing does not currently call `DataDecoder::Deflate`, so it does
++not exercise this route. To issue one harmless browser-process request through
++the real `DataDecoderService` and `Gzipper::Deflate` path, launch Chromium with
++the existing three distributed switches and this startup URL:
++
++```text
++chrome://distributed-utility-test/
++```
++
++The test uses a fixed non-user string, inflates the result locally to verify
++it, and logs only whether remote Deflate succeeded or local fallback was used.
++It never logs the fixed payload, the compressed response, or authentication
++data. The URL is a development-only startup trigger, not a new switch.
 diff --git a/content/distributed/distributed_utility_proxy.cc b/content/distributed/distributed_utility_proxy.cc
 new file mode 100644
 index 00000000..952abc27
@@ -375,6 +402,125 @@ index 00000000..952abc27
 +}
 +
 +}  // namespace content::distributed
+diff --git a/content/distributed/distributed_utility_smoke_test.cc b/content/distributed/distributed_utility_smoke_test.cc
+new file mode 100644
+index 00000000..11111111
+--- /dev/null
++++ b/content/distributed/distributed_utility_smoke_test.cc
+@@ -0,0 +1,91 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/distributed/distributed_utility_smoke_test.h"
++
++#include <memory>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "content/distributed/distributed_utility_proxy.h"
++#include "mojo/public/cpp/base/big_buffer.h"
++#include "services/data_decoder/public/cpp/data_decoder.h"
++
++namespace content::distributed {
++namespace {
++
++constexpr std::string_view kSmokeTestUrl =
++    "chrome://distributed-utility-test/";
++constexpr std::string_view kSmokeTestPayload =
++    "distributed-utility-fixed-smoke-test-v1";
++
++bool SmokeTestWasRequested() {
++  for (const auto& argument :
++       base::CommandLine::ForCurrentProcess()->GetArgs()) {
++    if (argument == kSmokeTestUrl) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void OnSmokeTestInflated(
++    std::unique_ptr<data_decoder::DataDecoder> decoder,
++    base::expected<mojo_base::BigBuffer, std::string> result) {
++  if (!result.has_value()) {
++    LOG(ERROR) << "DISTRIBUTED_SMOKE_TEST: result=inflate_failed";
++    return;
++  }
++
++  const mojo_base::BigBuffer& inflated = result.value();
++  const std::string_view inflated_text(
++      reinterpret_cast<const char*>(inflated.data()), inflated.size());
++  if (inflated_text != kSmokeTestPayload) {
++    LOG(ERROR) << "DISTRIBUTED_SMOKE_TEST: result=output_mismatch";
++    return;
++  }
++
++  LOG(INFO) << "DISTRIBUTED_SMOKE_TEST: result=output_verified";
++}
++
++void OnSmokeTestDeflated(
++    std::unique_ptr<data_decoder::DataDecoder> decoder,
++    base::expected<mojo_base::BigBuffer, std::string> result) {
++  if (!result.has_value()) {
++    LOG(ERROR) << "DISTRIBUTED_SMOKE_TEST: result=deflate_failed";
++    return;
++  }
++
++  mojo_base::BigBuffer compressed = std::move(result).value();
++  data_decoder::DataDecoder* decoder_ptr = decoder.get();
++  decoder_ptr->Inflate(
++      base::span(compressed), kSmokeTestPayload.size(),
++      base::BindOnce(&OnSmokeTestInflated, std::move(decoder)));
++}
++
++}  // namespace
++
++void MaybeRunDistributedUtilitySmokeTest() {
++  if (!SmokeTestWasRequested()) {
++    return;
++  }
++
++  if (!ShouldRouteDataDecoderRemotely()) {
++    LOG(WARNING) << "DISTRIBUTED_SMOKE_TEST: route=local_only; "
++                    "distributed configuration is incomplete";
++  }
++
++  auto decoder = std::make_unique<data_decoder::DataDecoder>();
++  data_decoder::DataDecoder* decoder_ptr = decoder.get();
++  decoder_ptr->Deflate(
++      base::as_byte_span(kSmokeTestPayload),
++      base::BindOnce(&OnSmokeTestDeflated, std::move(decoder)));
++}
++
++}  // namespace content::distributed
+diff --git a/content/distributed/distributed_utility_smoke_test.h b/content/distributed/distributed_utility_smoke_test.h
+new file mode 100644
+index 00000000..22222222
+--- /dev/null
++++ b/content/distributed/distributed_utility_smoke_test.h
+@@ -0,0 +1,16 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_SMOKE_TEST_H_
++#define CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_SMOKE_TEST_H_
++
++namespace content::distributed {
++
++// Runs one fixed-data Deflate round trip only when the development smoke-test
++// startup URL is present. The normal browser startup path is otherwise inert.
++void MaybeRunDistributedUtilitySmokeTest();
++
++}  // namespace content::distributed
++
++#endif  // CONTENT_DISTRIBUTED_DISTRIBUTED_UTILITY_SMOKE_TEST_H_
 diff --git a/content/distributed/distributed_utility_proxy.h b/content/distributed/distributed_utility_proxy.h
 new file mode 100644
 index 00000000..489cd688
@@ -435,7 +581,7 @@ new file mode 100644
 index 00000000..aa0897a5
 --- /dev/null
 +++ b/content/distributed/remote_data_decoder_service.cc
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,223 @@
 +// Copyright 2026 The Chromium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -451,6 +597,7 @@ index 00000000..aa0897a5
 +
 +#include "base/check.h"
 +#include "base/functional/bind.h"
++#include "base/logging.h"
 +#include "base/memory/weak_ptr.h"
 +#include "mojo/public/cpp/bindings/remote.h"
 +#include "mojo/public/cpp/bindings/self_owned_receiver.h"
@@ -609,9 +756,11 @@ index 00000000..aa0897a5
 +    data_decoder::mojom::Gzipper::DeflateCallback callback,
 +    LocalGzipperDeflateCallback local_deflate) {
 +  if (remote_result.outcome == RemoteGzipperOutcome::kSuccess) {
++    LOG(INFO) << "DISTRIBUTED: remote Deflate succeeded";
 +    std::move(callback).Run(ToBuffer(remote_result.payload));
 +    return;
 +  }
++  LOG(WARNING) << "DISTRIBUTED: remote Deflate failed; using local fallback";
 +  local_deflate.Run(std::move(original_data), std::move(callback));
 +}
 +
@@ -770,7 +919,7 @@ index 00000000..295b5f70
 +  if (input.size() == 0) {
 +    return std::string();
 +  }
-+  return std::string(static_cast<const char*>(input.data()), input.size());
++  return std::string(reinterpret_cast<const char*>(input.data()), input.size());
 +}
 +
 +std::string DeflateLocally(std::string_view input) {
@@ -1223,7 +1372,7 @@ index 00000000..6413d1a4
 +  if (data.size() == 0) {
 +    return std::string();
 +  }
-+  return std::string(static_cast<const char*>(data.data()), data.size());
++  return std::string(reinterpret_cast<const char*>(data.data()), data.size());
 +}
 +
 +struct FallbackState {
@@ -2657,7 +2806,7 @@ index 00000000..ed2dff6d
 +  if (input.size() == 0) {
 +    return std::string();
 +  }
-+  return std::string(static_cast<const char*>(input.data()), input.size());
++  return std::string(reinterpret_cast<const char*>(input.data()), input.size());
 +}
 +
 +}  // namespace
@@ -3152,7 +3301,7 @@ index 00000000..0a108e89
 +  if (input.size() == 0) {
 +    return std::string();
 +  }
-+  return std::string(static_cast<const char*>(input.data()), input.size());
++  return std::string(reinterpret_cast<const char*>(input.data()), input.size());
 +}
 +
 +void SetUint32(uint32_t value, size_t offset, std::string* output) {
