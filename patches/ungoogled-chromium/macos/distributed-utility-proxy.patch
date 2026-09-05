@@ -3027,6 +3027,8 @@ index 00000000..3b809e59
 +  base::AtExitManager at_exit_manager;
 +  base::CommandLine::Init(argc, argv);
 +  base::SingleThreadTaskExecutor task_executor(base::MessagePumpType::IO);
++  base::FileDescriptorWatcher file_descriptor_watcher(
++      task_executor.task_runner());
 +
 +  const base::CommandLine& command_line =
 +      *base::CommandLine::ForCurrentProcess();
