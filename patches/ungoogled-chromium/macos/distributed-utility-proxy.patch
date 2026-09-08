@@ -35,7 +35,7 @@ index e605be3d..299e1261 100644
  #include "content/public/browser/audio_service.h"
  #include "content/public/browser/background_tracing.h"
  #include "content/public/browser/browser_main_parts.h"
-@@ -402,6 +403,23 @@ class OopDataDecoder : public data_decoder::ServiceProvider {
+@@ -402,6 +403,25 @@ class OopDataDecoder : public data_decoder::ServiceProvider {
    void BindDataDecoderService(
        mojo::PendingReceiver<data_decoder::mojom::DataDecoderService> receiver)
        override {
@@ -48,10 +48,12 @@ index e605be3d..299e1261 100644
 +            ServiceProcessHost::Options()
 +                .WithDisplayName("Data Decoder Service (local fallback)")
 +                .Pass());
-+        distributed::BindRemoteDataDecoderService(
-+            std::move(receiver),
-+            distributed::GetDistributedUtilityWorkerEndpoint(), *token,
-+            local_service.Unbind());
++        GetIOThreadTaskRunner({})->PostTask(
++            FROM_HERE,
++            base::BindOnce(&distributed::BindRemoteDataDecoderService,
++                           std::move(receiver),
++                           distributed::GetDistributedUtilityWorkerEndpoint(),
++                           *token, local_service.Unbind()));
 +        return;
 +      }
 +    }
@@ -59,7 +61,7 @@ index e605be3d..299e1261 100644
      ServiceProcessHost::Launch(
          std::move(receiver),
          ServiceProcessHost::Options()
-@@ -1337,3 +1355,5 @@ void BrowserMainLoop::PostCreateThreadsImpl() {
+@@ -1337,3 +1357,5 @@ void BrowserMainLoop::PostCreateThreadsImpl() {
    data_decoder_service_provider_ = std::make_unique<OopDataDecoder>();
 -
 +
